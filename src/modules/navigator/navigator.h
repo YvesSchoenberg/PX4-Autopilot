@@ -312,9 +312,9 @@ public:
 
 	void trigger_hagl_failsafe(uint8_t nav_state);
 
-	void updateStartOfRTLPathPlanner(const matrix::Vector2<double> &start)
+	int set_start_and_plan_path_to_destination(const matrix::Vector2<double> &start)
 	{
-		_geofence.updateStartForRTLPathPlanner(start);
+		return _geofence.set_start_and_start_path_to_destination(start);
 	}
 
 	void updateDestinationOfRTLPathPlanner(const matrix::Vector2<double> &destination)
@@ -322,7 +322,10 @@ public:
 		_geofence.updateDestinationForRTLPathPlanner(destination);
 	}
 
-	const PlannedPath &planPath() { return _geofence.planPath(); }
+	matrix::Vector2d get_point_at_index(int index) const
+	{
+		return _geofence.get_point_at_index(index);
+	}
 
 	/**
 	 * Returns the last position that was confirmed to be inside all geofences.
