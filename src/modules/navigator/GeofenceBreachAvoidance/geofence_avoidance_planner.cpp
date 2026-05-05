@@ -121,8 +121,6 @@ bool GeofenceAvoidancePlanner::update_vertices(GeofenceInterface &geofence, floa
 bool GeofenceAvoidancePlanner::update_graph_nodes_without_start_and_destination(
 	GeofenceInterface &geofence, float margin)
 {
-	// local frame is anchored at _reference (set by update_vertices); this can be computed
-	// once up-front; start and destination nodes are filled in later when they are known
 	const int num_polygons = geofence.getNumPolygons();
 
 	int node_index = 0;
@@ -177,8 +175,8 @@ bool GeofenceAvoidancePlanner::update_graph_nodes_without_start_and_destination(
 		}
 	}
 
-	// node_index now points at the reserved destination slot; total count includes it
-	_num_vertices = node_index - 1;
+	// node_index equals the polygon vertex count; the destination is reserved one slot beyond
+	_num_vertices = node_index;
 	_num_nodes = node_index + 1;	// +1 for the destination
 
 	return true;
@@ -187,12 +185,10 @@ bool GeofenceAvoidancePlanner::update_graph_nodes_without_start_and_destination(
 void GeofenceAvoidancePlanner::update_distances_between_vertices(GeofenceInterface &geofence)
 {
 	perf_begin(_setup_distances_perf);
-	// vertices occupy indices 0 .. _num_vertices-1
-	const int last_vertex = _num_vertices;
 
 	// loop through all possible vertex to vertex combinations and store the distance between them
-	for (int i = 0; i <= last_vertex; i++) {
-		for (int j = i + 1; j <= last_vertex; j++) {
+	for (int i = 0; i < _num_vertices; i++) {
+		for (int j = i + 1; j < _num_vertices; j++) {
 			const size_t idx = geofence_utils::symmetricPairIndex(i, j, _num_nodes);
 
 			const bool clear = !geofence.checkIfLineViolatesAnyFence(_positions[i],
@@ -232,7 +228,7 @@ void GeofenceAvoidancePlanner::update_destination(const matrix::Vector2d &destin
 	_positions[dest_idx] = dest_local;
 
 	// distances from each vertex to destination
-	for (int graph_idx = 0; graph_idx <= _num_vertices; graph_idx++) {
+	for (int graph_idx = 0; graph_idx < _num_vertices; graph_idx++) {
 		const size_t dist_idx = geofence_utils::symmetricPairIndex(graph_idx, dest_idx, _num_nodes);
 
 		const bool clear = !geofence.checkIfLineViolatesAnyFence(_positions[graph_idx],
