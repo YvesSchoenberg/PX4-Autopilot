@@ -67,12 +67,14 @@ typedef int clockid_t;
 #ifndef CLOCK_MONOTONIC_COARSE
 #define CLOCK_MONOTONIC_COARSE CLOCK_MONOTONIC
 #endif
-#ifndef _TIMEVAL_DEFINED
-#define _TIMEVAL_DEFINED
-struct timeval {
-	long tv_sec;
-	long tv_usec;
-};
+/* The MSVC SDK declares `struct timeval` only inside <winsock.h> /
+ * <winsock2.h>, and does so unconditionally — no header guard. Pull it
+ * from there so any later <sys/socket.h>-via-<winsock2.h> include doesn't
+ * trigger a "redefinition" (C2011). NOMINMAX / WIN32_LEAN_AND_MEAN are
+ * already in effect via the SITL compile flags, so the cost here is
+ * mostly the winsock typedefs. */
+#ifndef _WINSOCK2API_
+#include <winsock2.h>
 #endif
 #else
 #include_next <time.h>

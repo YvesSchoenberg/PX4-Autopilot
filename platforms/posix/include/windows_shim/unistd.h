@@ -46,6 +46,15 @@
 
 #if defined(_MSC_VER) && !defined(__clang__)
 #include <sys/types.h>
+#elif defined(_WIN32)
+/*
+ * MinGW declares its own usleep() in <unistd.h>. Pull the rest of that
+ * header through normally, but hide only that declaration so PX4 can provide
+ * the same high-resolution Windows implementation for system_usleep.
+ */
+#define usleep _px4_mingw_runtime_usleep
+#include_next <unistd.h>
+#undef usleep
 #else
 #include_next <unistd.h>
 #endif
@@ -115,20 +124,265 @@
 extern "C" {
 #endif
 
+#if defined(_WIN32)
+/* CREATE_WAITABLE_TIMER_HIGH_RESOLUTION (Windows 10 1803+; build 17134)
+ * may not be defined in older SDK headers - fall back to the literal
+ * value documented by Microsoft. Same for the manual-reset flag. */
+#ifndef CREATE_WAITABLE_TIMER_MANUAL_RESET
+#define CREATE_WAITABLE_TIMER_MANUAL_RESET 0x00000001
+#endif
+#ifndef CREATE_WAITABLE_TIMER_HIGH_RESOLUTION
+#define CREATE_WAITABLE_TIMER_HIGH_RESOLUTION 0x00000002
+#endif
+
 #if defined(_MSC_VER) && !defined(__clang__)
-/** @brief Sleep for at least @p usec microseconds using Windows Sleep(). */
+#define PX4_WINDOWS_SLEEP_TLS __declspec(thread)
+#else
+#define PX4_WINDOWS_SLEEP_TLS __thread
+#endif
+
+/**
+ * Runtime-tuned thresholds that drive the spin-residual hybrid below.
+ *
+ * Defined and (optionally) auto-calibrated by
+ * px4_windows_calibrate_usleep_threshold() in
+ * platforms/posix/src/px4/windows/runtime/init.cpp. The calibration runs
+ * immediately after timeBeginPeriod(1), before any module thread starts
+ * calling usleep(), so the first usleep() the process performs already
+ * sees the tuned value.
+ *
+ * Override at process startup with the PX4_USLEEP_SPIN_US environment
+ * variable (clamped to [0, 50000] microseconds). Values <= 50000 are
+ * accepted; 0 effectively forces every wait > 0 us through the timer +
+ * spin-tail path.
+ *
+ * @c g_usleep_spin_tail_us is the *upper bound* of the QPC spin closing
+ * the residual after the high-resolution waitable timer wakes. The
+ * adaptive controller in usleep() shrinks the tail per-thread toward
+ * the observed timer overshoot via an EWMA, so a quiet host pays only
+ * ~p95 jitter of CPU spin per call instead of the worst-case bound.
+ */
+extern long g_usleep_pure_spin_us;
+extern long g_usleep_spin_tail_us;
+
+/* Floor for the per-thread adaptive spin tail. Initialised by the
+ * calibration routine to the host-measured P95 waitable-timer jitter so
+ * the controller never trims the spin below the value we already know
+ * is needed to cover this host's observed long-tail wakes. Defaults to
+ * a conservative 700 us when calibration cannot run. */
+extern long g_usleep_adaptive_min_tail_us;
+
+/**
+ * @brief Sleep for at least @p usec microseconds with microsecond accuracy.
+ *
+ * Windows Sleep() is quantized to the system timer tick (~15.6 ms by
+ * default; 1 ms after timeBeginPeriod(1) in init.cpp). A 4 ms sleep
+ * therefore rounds up to a full HPET tick, throttling SITL sim time.
+ *
+ * The naive Sleep() path loses ~10 % of wall time. A pure HPET-backed
+ * waitable timer wakes within 0.3 - 0.7 ms of the target on a quiet
+ * system but quantizes to 1 ms under load, so a tight SITL producer
+ * (250 Hz - 1 kHz lockstep loop) accumulates 5 - 10 % drift.
+ *
+ * The current implementation is a spin-residual hybrid:
+ *
+ *   - Requests <= @c g_usleep_pure_spin_us are held entirely on the QPC
+ *     deadline. This covers SIH's normal lockstep wall-sleep cadence
+ *     (200 Hz - 2 kHz, 500 - 5000 us). Even a single 0.5 - 1 ms
+ *     scheduler-late wake in that band becomes visible as sim/wall
+ *     drift, so the short simulation waits pay CPU for determinism.
+ *
+ *   - For requests > @c g_usleep_pure_spin_us the bulk of the wait runs
+ *     on a high-resolution waitable timer (CreateWaitableTimerExW +
+ *     CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, Windows 10 1803+). The
+ *     timer is armed to wake @c g_usleep_spin_tail_us microseconds
+ *     early and the residual is closed by a QueryPerformanceCounter
+ *     busy-loop. This trades ~g_usleep_spin_tail_us of CPU per call for
+ *     microsecond-scale accuracy against the absolute QPC target.
+ *
+ * The HANDLE is cached per-thread in compiler-native TLS so we pay one
+ * CreateWaitableTimerExW per thread for the lifetime of the process.
+ */
 static inline int usleep(useconds_t usec)
 {
-	Sleep((DWORD)((usec + 999U) / 1000U));
+	if (usec == 0) {
+		return 0;
+	}
+
+	// Snapshot the tuned thresholds once per call. Reads of an unaligned
+	// long are atomic on x86_64; the calibration in init.cpp runs before
+	// any other thread starts, so no further synchronization is needed.
+	const long pure_spin_us = g_usleep_pure_spin_us;
+	const long spin_tail_us = g_usleep_spin_tail_us;
+	const long adaptive_floor_us = g_usleep_adaptive_min_tail_us;
+
+	LARGE_INTEGER qpc_freq;
+	LARGE_INTEGER qpc_start;
+	QueryPerformanceFrequency(&qpc_freq);
+	QueryPerformanceCounter(&qpc_start);
+
+	// Absolute QPC target = start + usec. The conversion uses 64-bit
+	// integer math throughout: at 10 MHz QPC and a 1-second sleep the
+	// product is 1e7, well within LONGLONG range.
+	const LONGLONG qpc_target = qpc_start.QuadPart
+				    + ((LONGLONG)usec * qpc_freq.QuadPart) / 1000000LL;
+
+	if ((long)usec > pure_spin_us) {
+		// Use compiler-native TLS instead of C++ thread_local because this
+		// header is also included from .c translation units.
+		static PX4_WINDOWS_SLEEP_TLS HANDLE timer = NULL;
+		// Per-thread adaptive spin-tail state. We track the timer wake
+		// overshoot (how late WaitForSingleObject returned past the
+		// requested bulk deadline) as an EWMA in microseconds, then size
+		// the spin tail at (overshoot_ewma + small_margin), bounded by
+		// [PX4_USLEEP_ADAPTIVE_MIN_TAIL_US, spin_tail_us].
+		// The EWMA is initialized with sentinel -1 so the first call
+		// uses the configured upper-bound tail; subsequent calls
+		// converge toward the host's actual jitter and trim the spin.
+		static PX4_WINDOWS_SLEEP_TLS long adaptive_tail_us = -1;
+		static PX4_WINDOWS_SLEEP_TLS long overshoot_ewma_us = -1;
+
+		if (timer == NULL) {
+			timer = CreateWaitableTimerExW(NULL, NULL,
+						       CREATE_WAITABLE_TIMER_HIGH_RESOLUTION
+						       | CREATE_WAITABLE_TIMER_MANUAL_RESET,
+						       TIMER_ALL_ACCESS);
+
+			if (timer == NULL) {
+				// Older Windows: legacy manual-reset timer
+				// still honors timeBeginPeriod(1).
+				timer = CreateWaitableTimerW(NULL, TRUE, NULL);
+			}
+		}
+
+		// Decide the spin tail for this call. First call (sentinel) -
+		// fall back to the configured upper bound so we definitely
+		// cover the deadline while we collect data. Subsequent calls
+		// use the EWMA-derived value.
+		long tail_us = (adaptive_tail_us < 0) ? spin_tail_us : adaptive_tail_us;
+
+		// Floor at the host-measured P95 jitter (set by the calibration
+		// routine in init.cpp). Trimming below this would force the QPC
+		// spin to absorb wakes past the deadline, which directly bleeds
+		// into sim/wall ratio.
+		if (tail_us < adaptive_floor_us) { tail_us = adaptive_floor_us; }
+
+		if (tail_us > spin_tail_us) { tail_us = spin_tail_us; }
+
+		if (timer != NULL) {
+			LARGE_INTEGER due;
+			// Wake tail_us early and close the gap by spin.
+			// Negative due time = relative interval, 100 ns units.
+			// Clamp the bulk wait to >= 0 in case the caller asked
+			// for a value just above pure_spin_us with a larger
+			// spin_tail_us; the QPC spin still enforces the deadline.
+			const LONGLONG bulk_us = (LONGLONG)usec - (LONGLONG)tail_us;
+			const LONGLONG bulk_us_clamped = bulk_us > 0 ? bulk_us : 0;
+			due.QuadPart = -(bulk_us_clamped * 10);
+
+			if (SetWaitableTimer(timer, &due, 0, NULL, NULL, FALSE)) {
+				// Use a millisecond timeout slightly longer than
+				// the requested sleep rather than INFINITE: a
+				// rare WaitForSingleObject misbehavior on Windows
+				// (observed under heavy SITL lockstep load) can
+				// otherwise hang the producer thread permanently.
+				// The QPC spin below still enforces the absolute
+				// deadline, so a premature wake is harmless.
+				const DWORD wait_ms_bulk = (DWORD)((bulk_us_clamped + 999LL) / 1000LL);
+				const DWORD wait_ms = wait_ms_bulk + 5U;   // +5 ms safety margin
+				WaitForSingleObject(timer, wait_ms);
+
+				// Adaptive update: measure how late we woke vs the
+				// requested bulk deadline (qpc_target - tail_us).
+				// Negative = woke early (good); positive = woke late
+				// and the spin tail had to absorb it. We track an
+				// upper-envelope EWMA: a late wake snaps the value up
+				// immediately, a stretch of clean wakes decays it down
+				// at 1/64 per call (~30 ms settle at 250 Hz). The plain
+				// mean would undersize the tail because the timer jitter
+				// distribution has a long upper tail and 5 % of waits
+				// can wake far past the mean - each such miss bleeds
+				// 100 - 1000 us into wall time and accumulates as
+				// sim/wall ratio drift.
+				LARGE_INTEGER wake_now;
+				QueryPerformanceCounter(&wake_now);
+				const LONGLONG bulk_target_qpc = qpc_target
+								 - ((LONGLONG)tail_us * qpc_freq.QuadPart) / 1000000LL;
+				LONGLONG overshoot_qpc = wake_now.QuadPart - bulk_target_qpc;
+				if (overshoot_qpc < 0) { overshoot_qpc = 0; }
+				const long overshoot_us =
+					(long)((overshoot_qpc * 1000000LL) / qpc_freq.QuadPart);
+
+				if (overshoot_ewma_us < 0) {
+					// First sample: seed at the configured upper
+					// bound so we don't undershoot before any
+					// data has been gathered.
+					overshoot_ewma_us = spin_tail_us;
+				}
+
+				// Fast attack, slow decay.
+				if (overshoot_us > overshoot_ewma_us) {
+					overshoot_ewma_us = overshoot_us;
+
+				} else {
+					overshoot_ewma_us =
+						(overshoot_ewma_us * 63 + overshoot_us + 32) / 64;
+				}
+
+				// Size the next call's tail at envelope + 200 us
+				// margin. The margin covers the residual gap between
+				// the slow-decay envelope and the instantaneous
+				// worst-case wake jitter; the floor and upper-bound
+				// clamps keep the controller from collapsing or
+				// running away.
+				adaptive_tail_us = overshoot_ewma_us + 200;
+
+				if (adaptive_tail_us < adaptive_floor_us) {
+					adaptive_tail_us = adaptive_floor_us;
+				}
+
+				if (adaptive_tail_us > spin_tail_us) {
+					adaptive_tail_us = spin_tail_us;
+				}
+
+			} else {
+				// Arming failed (very rare). Fall through to
+				// the QPC spin below; it will still hit the
+				// deadline, just with a brief CPU burn.
+			}
+		} else {
+			// No timer available at all: kernel Sleep() rounded
+			// up to the nearest millisecond. The spin tail below
+			// still corrects the residual.
+			const LONGLONG bulk_us = (LONGLONG)usec - (LONGLONG)tail_us;
+			const LONGLONG bulk_us_clamped = bulk_us > 0 ? bulk_us : 0;
+			Sleep((DWORD)((bulk_us_clamped + 999LL) / 1000LL));
+		}
+	}
+
+	// Close the residual against the absolute QPC target. For longer waits
+	// this is at most ~spin_tail_us of spin (often less because the waitable
+	// timer wakes slightly late). For SIH-sized waits it is the full request.
+	LARGE_INTEGER now;
+
+	do {
+		YieldProcessor();
+		QueryPerformanceCounter(&now);
+	} while (now.QuadPart < qpc_target);
+
 	return 0;
 }
 
+#undef PX4_WINDOWS_SLEEP_TLS
+
+#if defined(_MSC_VER) && !defined(__clang__)
 /** @brief Sleep for at least @p seconds seconds using Windows Sleep(). */
 static inline unsigned int sleep(unsigned int seconds)
 {
 	Sleep(seconds * 1000U);
 	return 0;
 }
+#endif
 #endif
 
 /* POSIX pipe(fd[2]) - default to 64 KiB buffer and binary mode. */

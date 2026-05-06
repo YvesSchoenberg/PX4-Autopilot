@@ -178,6 +178,11 @@ int pthread_cond_signal(pthread_cond_t *cond);
 int pthread_cond_broadcast(pthread_cond_t *cond);
 /** @} */
 
+#if defined(_MSC_VER) && !defined(__clang__)
+typedef void (*px4_pthread_cond_notify_callback_t)(pthread_cond_t *cond, int broadcast);
+int px4_pthread_cond_set_notify_callback(px4_pthread_cond_notify_callback_t callback);
+#endif
+
 /** @name Thread lifecycle functions
  *
  * Wrap CreateThread/WaitForSingleObject/CloseHandle with pthread-compatible
@@ -191,6 +196,8 @@ int pthread_detach(pthread_t thread);
 void pthread_exit(void *value_ptr);
 pthread_t pthread_self(void);
 int pthread_equal(pthread_t t1, pthread_t t2);
+int pthread_getschedparam(pthread_t thread, int *policy, struct sched_param *param);
+int pthread_setschedparam(pthread_t thread, int policy, const struct sched_param *param);
 int pthread_cancel(pthread_t thread);
 int pthread_kill(pthread_t thread, int sig);
 /** @} */
@@ -243,4 +250,18 @@ int pthread_getname_np(pthread_t thread, char *name, size_t len);
 
 #ifndef PTHREAD_STACK_MIN
 #define PTHREAD_STACK_MIN 16384
+#endif
+
+#if (defined(__PX4_WINDOWS) || defined(_WIN32)) && !defined(_MSC_VER) && \
+	(defined(ENABLE_LOCKSTEP_SCHEDULER) || defined(PX4_WINDOWS_PTHREAD_LOCKSTEP_BRIDGE))
+#ifdef __cplusplus
+extern "C" {
+#endif
+int px4_lockstep_pthread_cond_signal(pthread_cond_t *cond);
+int px4_lockstep_pthread_cond_broadcast(pthread_cond_t *cond);
+#ifdef __cplusplus
+}
+#endif
+#define pthread_cond_signal(cond_) px4_lockstep_pthread_cond_signal(cond_)
+#define pthread_cond_broadcast(cond_) px4_lockstep_pthread_cond_broadcast(cond_)
 #endif

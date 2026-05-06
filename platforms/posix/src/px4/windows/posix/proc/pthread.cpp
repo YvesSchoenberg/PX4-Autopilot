@@ -46,7 +46,11 @@
 
 #if defined(_MSC_VER) && !defined(__clang__)
 
+#include <atomic>
 #include <process.h>
+#include <mutex>
+#include <unordered_map>
+#include <vector>
 
 namespace
 {
@@ -58,6 +62,72 @@ struct PX4ThreadStart {
 	void *arg;
 	pthread_t self;
 };
+
+/* POSIX requires pthread_key_create() destructors to run on thread exit. The
+ * Win32 TLS API has no such hook, so we keep our own registry of keys with
+ * non-null destructors and walk it from the thread trampoline tail. Without
+ * this, every per-thread allocation registered via pthread_setspecific() leaks
+ * on the MSVC SITL build (e.g. CmdThreadSpecificData in px4_daemon::Server). */
+std::mutex &tls_destructor_mutex()
+{
+	static std::mutex m;
+	return m;
+}
+
+std::unordered_map<pthread_key_t, void (*)(void *)> &tls_destructors()
+{
+	static std::unordered_map<pthread_key_t, void (*)(void *)> map;
+	return map;
+}
+
+std::atomic<px4_pthread_cond_notify_callback_t> &cond_notify_callback()
+{
+	static std::atomic<px4_pthread_cond_notify_callback_t> callback{nullptr};
+	return callback;
+}
+
+void run_tls_destructors_on_exit()
+{
+	/* POSIX allows up to PTHREAD_DESTRUCTOR_ITERATIONS (typically 4) passes
+	 * because a destructor may install new TLS values. Snapshot under the
+	 * mutex, run unlocked so destructors can call pthread_key_delete()/
+	 * pthread_setspecific() without deadlocking. */
+	for (int pass = 0; pass < 4; ++pass) {
+		struct Pending {
+			pthread_key_t key;
+			void (*destructor)(void *);
+			void *value;
+		};
+		std::vector<Pending> pending;
+		{
+			std::lock_guard<std::mutex> guard(tls_destructor_mutex());
+			pending.reserve(tls_destructors().size());
+
+			for (const auto &entry : tls_destructors()) {
+				if (entry.second == nullptr) {
+					continue;
+				}
+
+				void *value = TlsGetValue(entry.first);
+
+				if (value == nullptr) {
+					continue;
+				}
+
+				pending.push_back({entry.first, entry.second, value});
+			}
+		}
+
+		if (pending.empty()) {
+			return;
+		}
+
+		for (const auto &p : pending) {
+			TlsSetValue(p.key, nullptr);
+			p.destructor(p.value);
+		}
+	}
+}
 
 BOOL CALLBACK init_mutex_once(PINIT_ONCE, PVOID parameter, PVOID *)
 {
@@ -95,6 +165,30 @@ static HANDLE handle_for_pthread(pthread_t thread)
 	return reinterpret_cast<HANDLE>(thread);
 }
 
+static int windows_thread_priority(int priority)
+{
+	if (priority >= THREAD_PRIORITY_TIME_CRITICAL) {
+		return THREAD_PRIORITY_TIME_CRITICAL;
+
+	} else if (priority >= THREAD_PRIORITY_HIGHEST) {
+		return THREAD_PRIORITY_HIGHEST;
+
+	} else if (priority >= THREAD_PRIORITY_ABOVE_NORMAL) {
+		return THREAD_PRIORITY_ABOVE_NORMAL;
+
+	} else if (priority == THREAD_PRIORITY_NORMAL) {
+		return THREAD_PRIORITY_NORMAL;
+
+	} else if (priority <= THREAD_PRIORITY_IDLE) {
+		return THREAD_PRIORITY_IDLE;
+
+	} else if (priority <= THREAD_PRIORITY_LOWEST) {
+		return THREAD_PRIORITY_LOWEST;
+	}
+
+	return THREAD_PRIORITY_BELOW_NORMAL;
+}
+
 static DWORD abstime_to_timeout_ms(const timespec *abstime)
 {
 	if (!abstime) {
@@ -128,6 +222,7 @@ unsigned __stdcall thread_trampoline(void *arg)
 	delete start;
 
 	const uintptr_t result = reinterpret_cast<uintptr_t>(entry(entry_arg));
+	run_tls_destructors_on_exit();
 	_endthreadex(static_cast<unsigned>(result));
 	return static_cast<unsigned>(result);
 }
@@ -459,6 +554,10 @@ int pthread_cond_signal(pthread_cond_t *cond)
 		return EINVAL;
 	}
 
+	if (px4_pthread_cond_notify_callback_t callback = cond_notify_callback().load(std::memory_order_acquire)) {
+		callback(cond, 0);
+	}
+
 	WakeConditionVariable(cond);
 	return 0;
 }
@@ -469,7 +568,17 @@ int pthread_cond_broadcast(pthread_cond_t *cond)
 		return EINVAL;
 	}
 
+	if (px4_pthread_cond_notify_callback_t callback = cond_notify_callback().load(std::memory_order_acquire)) {
+		callback(cond, 1);
+	}
+
 	WakeAllConditionVariable(cond);
+	return 0;
+}
+
+int px4_pthread_cond_set_notify_callback(px4_pthread_cond_notify_callback_t callback)
+{
+	cond_notify_callback().store(callback, std::memory_order_release);
 	return 0;
 }
 
@@ -499,7 +608,7 @@ int pthread_create(pthread_t *thread, const pthread_attr_t *attr, void *(*start_
 	*thread = static_cast<pthread_t>(handle);
 
 	if (attr && attr->sched.sched_priority != 0) {
-		SetThreadPriority(reinterpret_cast<HANDLE>(handle), attr->sched.sched_priority);
+		SetThreadPriority(reinterpret_cast<HANDLE>(handle), windows_thread_priority(attr->sched.sched_priority));
 	}
 
 	ResumeThread(reinterpret_cast<HANDLE>(handle));
@@ -522,6 +631,10 @@ int pthread_join(pthread_t thread, void **value_ptr)
 	HANDLE handle = reinterpret_cast<HANDLE>(thread);
 
 	if (WaitForSingleObject(handle, INFINITE) == WAIT_FAILED) {
+		/* Even on failure the caller has handed ownership of the handle
+		 * to pthread_join() per POSIX semantics; close it so we don't
+		 * leak the Win32 thread object. */
+		CloseHandle(handle);
 		return ESRCH;
 	}
 
@@ -547,6 +660,7 @@ int pthread_detach(pthread_t thread)
 
 void pthread_exit(void *value_ptr)
 {
+	run_tls_destructors_on_exit();
 	_endthreadex(static_cast<unsigned>(reinterpret_cast<uintptr_t>(value_ptr)));
 }
 
@@ -562,6 +676,34 @@ pthread_t pthread_self(void)
 int pthread_equal(pthread_t t1, pthread_t t2)
 {
 	return t1 == t2;
+}
+
+int pthread_getschedparam(pthread_t thread, int *policy, struct sched_param *param)
+{
+	if (!policy || !param) {
+		return EINVAL;
+	}
+
+	const int priority = GetThreadPriority(handle_for_pthread(thread));
+
+	if (priority == THREAD_PRIORITY_ERROR_RETURN && GetLastError() != ERROR_SUCCESS) {
+		return ESRCH;
+	}
+
+	*policy = SCHED_OTHER;
+	param->sched_priority = priority;
+	return 0;
+}
+
+int pthread_setschedparam(pthread_t thread, int policy, const struct sched_param *param)
+{
+	(void)policy;
+
+	if (!param) {
+		return EINVAL;
+	}
+
+	return SetThreadPriority(handle_for_pthread(thread), windows_thread_priority(param->sched_priority)) ? 0 : ESRCH;
 }
 
 int pthread_cancel(pthread_t thread)
@@ -584,8 +726,6 @@ int pthread_kill(pthread_t thread, int sig)
 
 int pthread_key_create(pthread_key_t *key, void (*destructor)(void *))
 {
-	(void)destructor;
-
 	if (!key) {
 		return EINVAL;
 	}
@@ -596,12 +736,21 @@ int pthread_key_create(pthread_key_t *key, void (*destructor)(void *))
 		return EAGAIN;
 	}
 
+	if (destructor) {
+		std::lock_guard<std::mutex> guard(tls_destructor_mutex());
+		tls_destructors()[index] = destructor;
+	}
+
 	*key = index;
 	return 0;
 }
 
 int pthread_key_delete(pthread_key_t key)
 {
+	{
+		std::lock_guard<std::mutex> guard(tls_destructor_mutex());
+		tls_destructors().erase(key);
+	}
 	return TlsFree(key) ? 0 : EINVAL;
 }
 

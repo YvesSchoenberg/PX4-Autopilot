@@ -61,16 +61,27 @@ int clock_gettime(clockid_t clk_id, struct timespec *tp)
 
 	if (clk_id == CLOCK_MONOTONIC) {
 		/* QPC is monotonic and high resolution, but relative to an arbitrary
-		 * boot-time counter. That is exactly what CLOCK_MONOTONIC promises. */
-		LARGE_INTEGER frequency {};
+		 * boot-time counter. That is exactly what CLOCK_MONOTONIC promises.
+		 *
+		 * Per Microsoft's QueryPerformanceCounter guidance, the QPC frequency
+		 * is fixed at system boot and consistent across processors, so we
+		 * only need to query it once. clock_gettime is on PX4's hot path
+		 * (drv_hrt's hrt_absolute_time, lockstep_scheduler, every uORB
+		 * publish/subscribe), and a syscall here adds up quickly.
+		 */
+		static const int64_t frequency = []() {
+			LARGE_INTEGER f {};
+			QueryPerformanceFrequency(&f);
+			return f.QuadPart;
+		}();
+
 		LARGE_INTEGER counter {};
-		QueryPerformanceFrequency(&frequency);
 		QueryPerformanceCounter(&counter);
 
-		const uint64_t seconds = static_cast<uint64_t>(counter.QuadPart / frequency.QuadPart);
-		const uint64_t remainder = static_cast<uint64_t>(counter.QuadPart % frequency.QuadPart);
+		const uint64_t seconds = static_cast<uint64_t>(counter.QuadPart / frequency);
+		const uint64_t remainder = static_cast<uint64_t>(counter.QuadPart % frequency);
 		tp->tv_sec = static_cast<time_t>(seconds);
-		tp->tv_nsec = static_cast<long>((remainder * 1000000000ULL) / static_cast<uint64_t>(frequency.QuadPart));
+		tp->tv_nsec = static_cast<long>((remainder * 1000000000ULL) / static_cast<uint64_t>(frequency));
 		return 0;
 	}
 

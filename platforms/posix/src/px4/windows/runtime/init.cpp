@@ -43,7 +43,35 @@
 
 #include "px4_windows_internal.h"
 
+#include <algorithm>
 #include <array>
+#include <mutex>
+#include <string>
+#include <vector>
+
+// timeBeginPeriod / timeEndPeriod live in winmm. Without raising the
+// system timer resolution, the Windows scheduler quantizes Sleep() to
+// the default ~15.6 ms HPET tick, which throttles SITL sim time to
+// ~40 % of wall time. Requesting 1 ms resolution drops the floor to
+// the documented minimum.
+#include <timeapi.h>
+
+// CREATE_WAITABLE_TIMER_HIGH_RESOLUTION (Windows 10 1803+, build 17134)
+// may not be defined in older SDK headers. Mirror the literal values
+// documented by Microsoft - same fallback as windows_shim/unistd.h.
+#ifndef CREATE_WAITABLE_TIMER_MANUAL_RESET
+#define CREATE_WAITABLE_TIMER_MANUAL_RESET 0x00000001
+#endif
+#ifndef CREATE_WAITABLE_TIMER_HIGH_RESOLUTION
+#define CREATE_WAITABLE_TIMER_HIGH_RESOLUTION 0x00000002
+#endif
+
+#if defined(_MSC_VER)
+// MSVC CRT debug heap: dumps unfreed allocations to stderr.
+// We invoke it explicitly from px4_windows_exit() because the daemon
+// shuts down via ExitProcess(), which bypasses _CRTDBG_LEAK_CHECK_DF.
+#include <crtdbg.h>
+#endif
 
 /* --------------------------------------------------------------------------
  * One-time process-wide initialisation.
@@ -56,6 +84,181 @@
  * via InterlockedCompareExchange from proc/ids.cpp. External linkage so
  * the extern declaration in proc/ids.cpp resolves. */
 volatile LONG g_px4_session_id = 0;
+
+/* Runtime-tuned thresholds consumed by the inline usleep() shim in
+ * platforms/posix/include/windows_shim/unistd.h. The defaults are sized
+ * to give a high-resolution-timer-equipped host (Windows 10 1803+) a
+ * safe starting point: 5 ms pure-spin ceiling and 1 ms spin-tail. The
+ * tail is the *upper bound* the thread-local adaptive controller in
+ * usleep() may expand to; it shrinks toward the observed timer overshoot
+ * via an EWMA so a quiet host pays only ~p95-jitter of CPU spin per
+ * call. They live at file scope because every translation unit that
+ * includes <unistd.h> on Windows references them through the inline body
+ * of usleep(). */
+extern "C" long g_usleep_pure_spin_us = 5000;
+extern "C" long g_usleep_spin_tail_us = 1000;
+/* Floor for the per-thread adaptive spin tail. Initialised by
+ * px4_windows_calibrate_usleep_threshold() to the host-measured P95
+ * waitable-timer jitter so the controller never collapses below the
+ * value we already know is needed to cover the observed long-tail wakes.
+ * Defaults to a conservative 700 us when calibration cannot run (e.g.
+ * pre-1803 Windows with no high-resolution timer). */
+extern "C" long g_usleep_adaptive_min_tail_us = 700;
+
+/**
+ * @brief Auto-tune g_usleep_pure_spin_us against the host's measured
+ *        high-resolution waitable-timer jitter and apply an optional
+ *        environment override.
+ *
+ * Must be invoked exactly once and BEFORE any thread starts calling
+ * usleep(). The constructor of PX4WindowsGlobalInit calls it directly
+ * after timeBeginPeriod(1) - the earliest hookable point in the PX4
+ * Windows startup sequence.
+ *
+ * Honors PX4_USLEEP_SPIN_US (microseconds, clamped to [0, 50000]). When
+ * unset, probes the *exact* primitive the inline usleep() shim uses for
+ * the bulk wait: a CREATE_WAITABLE_TIMER_HIGH_RESOLUTION waitable timer
+ * armed for 1 ms via SetWaitableTimer + WaitForSingleObject. The chosen
+ * threshold is g_usleep_spin_tail_us + p95_jitter + 500 us margin, so
+ * any wait above the threshold can be served by (timer + spin tail) and
+ * still hit the absolute QPC deadline. Floored to 500 us and capped at
+ * 5000 us.
+ *
+ * The previous heuristic measured Sleep(1) jitter, but Sleep is not on
+ * the hot path - usleep() uses the high-resolution waitable timer, which
+ * is far more accurate than Sleep on Win10 1803+. Probing the wrong
+ * primitive made the auto-tune saturate at 5000 us on quiet hosts, which
+ * forced every SIH 4 ms tick into pure-spin and pegged one full core.
+ */
+static void px4_windows_calibrate_usleep_threshold()
+{
+	// 1. Honor an explicit env override first; most users / CI runs set
+	// this from the launcher script, so skip the probe entirely when present.
+	if (const char *env = std::getenv("PX4_USLEEP_SPIN_US")) {
+		char *end = nullptr;
+		long v = std::strtol(env, &end, 10);
+
+		if (end != env && v >= 0 && v <= 50000) {
+			g_usleep_pure_spin_us = v;
+			// Env override skips probing the host so we
+			// have no measured P95 - keep the conservative
+			// upper-bound default for the adaptive floor.
+			g_usleep_adaptive_min_tail_us = g_usleep_spin_tail_us;
+			std::printf("INFO  [px4_windows] usleep spin threshold (env): %ld us "
+				    "(adaptive tail floor: %ld us)\n",
+				    v, g_usleep_adaptive_min_tail_us);
+			std::fflush(stdout);
+			return;
+		}
+
+		std::printf("WARN  [px4_windows] PX4_USLEEP_SPIN_US=\"%s\" out of range [0, 50000], ignored\n",
+			    env);
+		std::fflush(stdout);
+	}
+
+	// 2. Probe the actual primitive usleep() uses for the bulk wait: a
+	// CREATE_WAITABLE_TIMER_HIGH_RESOLUTION waitable timer armed via
+	// SetWaitableTimer + WaitForSingleObject. On Win10 1803+ this gives
+	// sub-millisecond accuracy; the residual is closed by the QPC spin
+	// tail (g_usleep_spin_tail_us). The threshold we want is the smallest
+	// value such that (waitable_timer + spin_tail) reliably hits the
+	// deadline.
+	HANDLE timer = CreateWaitableTimerExW(NULL, NULL,
+					      CREATE_WAITABLE_TIMER_HIGH_RESOLUTION
+					      | CREATE_WAITABLE_TIMER_MANUAL_RESET,
+					      TIMER_ALL_ACCESS);
+
+	if (timer == NULL) {
+		// Older Windows (pre-1803) lacks the high-res flag. Keep the
+		// historical 5000 us default - on those hosts the legacy timer
+		// quantizes to ~1 ms tick and the wide spin band is the safest
+		// behavior available.
+		g_usleep_pure_spin_us = 5000;
+		// Without a high-res timer the legacy 1 ms tick dominates;
+		// lock the adaptive floor to spin_tail_us so the controller
+		// can't shrink the spin below the safe bound on this host.
+		g_usleep_adaptive_min_tail_us = g_usleep_spin_tail_us;
+		std::printf("INFO  [px4_windows] usleep spin threshold (auto): 5000 us "
+			    "(high-res waitable timer unavailable, using legacy default)\n");
+		std::fflush(stdout);
+		return;
+	}
+
+	LARGE_INTEGER freq;
+	QueryPerformanceFrequency(&freq);
+
+	// N=500 keeps ~25 samples in the p95 tail (vs 5 at N=100), which removes
+	// the intermittent low-p95 outlier that under-provisioned the spin tail
+	// and tripped the sim/wall ratio below 0.99 once every few cold boots.
+	// Probe cost is ~500 ms of one-time startup time (each iteration waits 1
+	// ms on the high-res timer); negligible vs the robustness gain.
+	constexpr int N = 500;
+	long jitter_us[N];
+
+	for (int i = 0; i < N; ++i) {
+		LARGE_INTEGER t0;
+		LARGE_INTEGER t1;
+		LARGE_INTEGER due;
+		// Ask for 1 ms (10 000 x 100 ns units, negative = relative).
+		due.QuadPart = -10000;
+		QueryPerformanceCounter(&t0);
+
+		if (SetWaitableTimer(timer, &due, 0, NULL, NULL, FALSE)) {
+			WaitForSingleObject(timer, INFINITE);
+		}
+
+		QueryPerformanceCounter(&t1);
+		const long actual_us = (long)(((t1.QuadPart - t0.QuadPart) * 1000000LL) / freq.QuadPart);
+		long delta = actual_us - 1000;
+
+		if (delta < 0) { delta = 0; }
+
+		jitter_us[i] = delta;
+	}
+
+	CloseHandle(timer);
+	std::sort(jitter_us, jitter_us + N);
+	const long p95 = jitter_us[(int)(0.95 * N)];
+
+	// 3. Choose threshold = spin_tail + p95_jitter + 500 us margin. Any
+	// wait above this is served by (waitable timer wakes ~p95 us late
+	// at most + spin tail closes the residual). Floor at 500 us so the
+	// short-sleep band never collapses (avoids degenerate 0-cost loops);
+	// cap at 5000 us so a freakishly noisy host still falls back to the
+	// legacy behavior.
+	long chosen = g_usleep_spin_tail_us + p95 + 500;
+
+	if (chosen < 500) { chosen = 500; }
+
+	if (chosen > 5000) { chosen = 5000; }
+
+	g_usleep_pure_spin_us = chosen;
+	// Right-size the spin-tail upper bound to (P95 + 500 us). This is
+	// the largest value the per-thread adaptive controller in usleep()
+	// is allowed to grow to, so we trade a couple hundred microseconds
+	// of CPU spin per call for a robust deadline guarantee. The +500
+	// (was +300) absorbs the residual P95 underestimate even when the
+	// N=500 probe still under-samples a freakishly quiet host. Floored
+	// at 700 us (so quiet hosts still cover the typical Win10 1803+
+	// jitter floor) and capped at 2000 us (the historical safe value).
+	long sized_tail = p95 + 500;
+	if (sized_tail < 700) { sized_tail = 700; }
+	if (sized_tail > 2000) { sized_tail = 2000; }
+	g_usleep_spin_tail_us = sized_tail;
+	// Set the adaptive tail floor to the host-measured P95 jitter
+	// (clamped to [200, sized_tail]) so the per-thread controller in
+	// usleep() can never trim the spin below the value we already know
+	// is needed to cover this host's observed long-tail wakes.
+	long adaptive_floor = p95;
+	if (adaptive_floor < 200) { adaptive_floor = 200; }
+	if (adaptive_floor > sized_tail) { adaptive_floor = sized_tail; }
+	g_usleep_adaptive_min_tail_us = adaptive_floor;
+	std::printf("INFO  [px4_windows] usleep spin threshold (auto): %ld us "
+		    "(p95 high-res timer jitter: %ld us [N=%d], spin tail: %ld us, "
+		    "adaptive tail floor: %ld us)\n",
+		    chosen, p95, N, sized_tail, adaptive_floor);
+	std::fflush(stdout);
+}
 
 namespace
 {
@@ -134,6 +337,7 @@ struct PX4WindowsGlobalInit {
 	// Inline Linux syscall helpers (x86_64 ABI).
 	static long long linux_syscall1(long long num, long long a)
 	{
+#if defined(__GNUC__) || defined(__clang__)
 		long long ret;
 		__asm__ volatile (
 			"syscall"
@@ -142,10 +346,16 @@ struct PX4WindowsGlobalInit {
 			: "rcx", "r11", "memory"
 		);
 		return ret;
+#else
+		(void)num;
+		(void)a;
+		return -1;
+#endif
 	}
 
 	static long long linux_syscall3(long long num, long long a, long long b, long long c)
 	{
+#if defined(__GNUC__) || defined(__clang__)
 		long long ret;
 		__asm__ volatile (
 			"syscall"
@@ -154,6 +364,13 @@ struct PX4WindowsGlobalInit {
 			: "rcx", "r11", "memory"
 		);
 		return ret;
+#else
+		(void)num;
+		(void)a;
+		(void)b;
+		(void)c;
+		return -1;
+#endif
 	}
 
 	static long long open_host_tty()
@@ -260,6 +477,8 @@ struct PX4WindowsGlobalInit {
 		}
 	}
 
+	bool timer_resolution_raised = false;
+
 	PX4WindowsGlobalInit()
 	{
 		WSADATA wsaData;
@@ -267,6 +486,24 @@ struct PX4WindowsGlobalInit {
 			fprintf(stderr, "PX4: WSAStartup failed\n");
 		}
 		SetConsoleOutputCP(CP_UTF8);
+
+		// Raise the global timer resolution to 1 ms. The default
+		// (~15.6 ms) makes every usleep() round up to a full HPET
+		// tick, throttling SITL sim time to ~40 % of wall time. The
+		// matching timeEndPeriod(1) lives in the destructor; Windows
+		// also clears the request on process exit, so a hard
+		// ExitProcess() path is still safe.
+		if (timeBeginPeriod(1) == TIMERR_NOERROR) {
+			timer_resolution_raised = true;
+		}
+
+		// Tune g_usleep_pure_spin_us either from PX4_USLEEP_SPIN_US or
+		// by probing this host's Sleep(1) jitter. Must run AFTER
+		// timeBeginPeriod(1) so the probe sees the same scheduler
+		// behavior usleep() will see, and BEFORE any module thread
+		// has had a chance to start (we are in a static constructor,
+		// so PX4 main() has not yet been entered).
+		px4_windows_calibrate_usleep_threshold();
 
 		// PX4 stores binary data (parameters.bson, dataman) and expects
 		// read/write to preserve bytes exactly. MSVCRT's default text
@@ -326,10 +563,100 @@ struct PX4WindowsGlobalInit {
 	{
 		restore_console_modes();
 		WSACleanup();
+
+		if (timer_resolution_raised) {
+			timeEndPeriod(1);
+			timer_resolution_raised = false;
+		}
 	}
 };
 static PX4WindowsGlobalInit _px4_win_init;
+
+// Filesystem paths the process owns and must remove on any exit path.
+// Used by px4_windows_exit() to undo the byte-range lock files that the
+// daemon installs in %TEMP% via set_server_running(); the explicit unlink
+// in main.cpp only runs when the pxh shell loop returns normally, but the
+// `pxh shutdown` command leaves via px4_platform_exit() -> ExitProcess()
+// and would otherwise leak the lock and PID-companion files.
+std::mutex _px4_exit_unlink_mutex;
+std::vector<std::string> _px4_exit_unlink_paths;
+
+// File descriptors held open for the lifetime of the process (typically the
+// byte-range lock fd installed by set_server_running). Windows refuses to
+// unlink a file while any handle to it is open in the same process, so the
+// exit path must close these BEFORE running the registered unlinks.
+std::vector<int> _px4_exit_close_fds;
+
+void px4_run_exit_unlinks()
+{
+	std::lock_guard<std::mutex> lock(_px4_exit_unlink_mutex);
+
+	// Close fds first so subsequent unlink() calls don't hit ERROR_SHARING_VIOLATION.
+	for (int fd : _px4_exit_close_fds) {
+		if (fd >= 0) {
+			(void)::_close(fd);
+		}
+	}
+
+	_px4_exit_close_fds.clear();
+
+	for (const std::string &path : _px4_exit_unlink_paths) {
+		// Best effort: ignore errors — the path may already be gone if a
+		// different shutdown route ran the explicit cleanup first.
+		(void)::_unlink(path.c_str());
+	}
+
+	_px4_exit_unlink_paths.clear();
+}
 } // namespace
+
+extern "C" void px4_windows_register_exit_unlink(const char *path)
+{
+	if (path == nullptr || path[0] == '\0') {
+		return;
+	}
+
+	std::lock_guard<std::mutex> lock(_px4_exit_unlink_mutex);
+
+	for (const std::string &existing : _px4_exit_unlink_paths) {
+		if (existing == path) {
+			return; // already registered
+		}
+	}
+
+	// Hard cap on entries so a buggy caller can't grow this unboundedly;
+	// the daemon only registers two paths (lock + .pid).
+	constexpr std::size_t kMaxRegistered = 16;
+
+	if (_px4_exit_unlink_paths.size() >= kMaxRegistered) {
+		return;
+	}
+
+	_px4_exit_unlink_paths.emplace_back(path);
+}
+
+extern "C" void px4_windows_register_exit_close_fd(int fd)
+{
+	if (fd < 0) {
+		return;
+	}
+
+	std::lock_guard<std::mutex> lock(_px4_exit_unlink_mutex);
+
+	for (int existing : _px4_exit_close_fds) {
+		if (existing == fd) {
+			return; // already registered
+		}
+	}
+
+	constexpr std::size_t kMaxRegistered = 16;
+
+	if (_px4_exit_close_fds.size() >= kMaxRegistered) {
+		return;
+	}
+
+	_px4_exit_close_fds.push_back(fd);
+}
 
 extern "C" void px4_windows_restore_console_modes()
 {
@@ -381,11 +708,32 @@ extern "C" void px4_windows_exit(int status)
 {
 	fflush(stdout);
 	fflush(stderr);
+
+	// Drop server lock + PID-companion files before tearing down the
+	// console. Done early so a follow-up launch racing this process can
+	// re-acquire the byte-range lock without falling through to the
+	// stale-lock recovery path in get_server_running().
+	px4_run_exit_unlinks();
+
+#if defined(_MSC_VER)
+	// ExitProcess()/TerminateProcess() skip the CRT exit chain, so
+	// _CRTDBG_LEAK_CHECK_DF never runs. Dump the leak report explicitly
+	// here, BEFORE FreeConsole() invalidates the stderr handle the CRT
+	// would write to.
+	_CrtDumpMemoryLeaks();
+	fflush(stderr);
+#endif
+
 	_px4_win_init.restore_console_modes();
 
 	if (!_px4_win_init.running_under_wine) {
 		FreeConsole();
 	}
+
+	// Static dtors do not run under ExitProcess()/TerminateProcess().
+	// Match WSAStartup() from the constructor by calling WSACleanup()
+	// explicitly so a soft-exit path does not appear to leak winsock state.
+	WSACleanup();
 
 	if (_px4_win_init.running_under_wine) {
 		TerminateProcess(GetCurrentProcess(), static_cast<UINT>(status));
