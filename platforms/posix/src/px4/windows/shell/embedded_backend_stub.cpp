@@ -60,6 +60,10 @@
 #include <io.h>
 #include <unistd.h>
 
+#ifdef _WIN32
+#include <windows.h>  // SearchPathA, MAX_PATH
+#endif
+
 namespace px4::embedded_shell
 {
 namespace
@@ -71,6 +75,26 @@ struct CommandResult {
 	int status{0};
 	std::string output{};
 };
+
+#ifdef _WIN32
+// Returns true if `command` resolves to an executable on PATH (or as a literal
+// path). Used to skip cmd.exe spawn for unrecognized commands so its localized
+// "path not found" stderr never reaches the user. Real programs that exist run
+// normally and their stderr passes through unfiltered.
+bool host_command_exists_on_path(const std::string &command)
+{
+	if (command.empty()) {
+		return false;
+	}
+
+	// SearchPathA also accepts paths with directory components and verifies
+	// they exist; .exe is the default extension probed when none is given.
+	char buffer[MAX_PATH];
+	const DWORD len = SearchPathA(nullptr, command.c_str(), ".exe",
+				      static_cast<DWORD>(sizeof(buffer)), buffer, nullptr);
+	return len > 0 && len < sizeof(buffer);
+}
+#endif
 
 struct ScanDepth {
 	int single_quotes{0};
@@ -263,6 +287,15 @@ private:
 	void set_variable(const std::string &name, const std::string &value)
 	{
 		_variables[name] = value;
+
+		// Keep the POSIX shell search path separate from the host Windows
+		// search path. rcS appends colon-separated entries to PATH, which is
+		// valid for the embedded shell but corrupts cmd.exe path lookup when a
+		// host fallback command is run.
+		if (name == "PATH") {
+			return;
+		}
+
 		_putenv_s(name.c_str(), value.c_str());
 	}
 
@@ -1208,6 +1241,17 @@ private:
 			host_command += quote_for_host_command(arg);
 		}
 
+#ifdef _WIN32
+
+		// Skip the cmd.exe spawn for unrecognized commands so its localized
+		// "path not found" stderr never reaches the user. Real programs that
+		// exist on PATH run normally and their stderr passes through.
+		if (!host_command_exists_on_path(command)) {
+			return -1;
+		}
+
+#endif
+
 		if (background) {
 			std::thread([host_command]() {
 				std::system(host_command.c_str());
@@ -1249,6 +1293,15 @@ private:
 		}
 
 #ifdef _WIN32
+
+		// Skip the cmd.exe spawn for unrecognized commands; see the matching
+		// pre-check in run_px4_or_host() for rationale.
+		if (!host_command_exists_on_path(command)) {
+			CommandResult missing{};
+			missing.status = -1;
+			return missing;
+		}
+
 		FILE *pipe = _popen(host_command.c_str(), "r");
 #else
 		FILE *pipe = popen(host_command.c_str(), "r");
@@ -1883,7 +1936,22 @@ private:
 			}
 
 			if (ch == '$') {
-				append_unquoted(expand_inline(input, i, false));
+				const std::string expanded = expand_inline(input, i, false);
+
+				// In real shells, the RHS of a variable assignment (`name=$expansion`)
+				// is never subject to word-splitting, regardless of quoting. Only the
+				// arguments of a command are. Without this exception a value like
+				// PATH=C:\Program Files\... would be split into a bogus token list
+				// (`value=C:\Program`, `Files\...`, ...) and the second word would
+				// be dispatched as a command. Detect the `<identifier>=` prefix in
+				// the in-progress token and keep the expansion intact.
+				if (token_active && current_starts_with_assignment(current)) {
+					current += expanded;
+
+				} else {
+					append_unquoted(expanded);
+				}
+
 				continue;
 			}
 
@@ -1893,6 +1961,29 @@ private:
 
 		flush();
 		return words;
+	}
+
+	static bool current_starts_with_assignment(const std::string &token)
+	{
+		const std::size_t eq = token.find('=');
+
+		if (eq == std::string::npos || eq == 0) {
+			return false;
+		}
+
+		if (!std::isalpha(static_cast<unsigned char>(token[0])) && token[0] != '_') {
+			return false;
+		}
+
+		for (std::size_t i = 1; i < eq; ++i) {
+			const unsigned char ch = static_cast<unsigned char>(token[i]);
+
+			if (!std::isalnum(ch) && ch != '_') {
+				return false;
+			}
+		}
+
+		return true;
 	}
 
 	std::string expand_to_string(const std::string &input)
