@@ -341,6 +341,7 @@ int Commander::custom_command(int argc, char *argv[])
 
 		} else {
 			PX4_ERR("missing argument");
+			return 1;
 		}
 	}
 
@@ -366,7 +367,7 @@ int Commander::custom_command(int argc, char *argv[])
 			send_vehicle_command(vehicle_command_s::VEHICLE_CMD_DO_SET_SAFETY_SWITCH_STATE, vehicle_command_s::SAFETY_OFF);
 
 		} else {
-			PX4_ERR("invlaid argument, use [on|off]");
+			PX4_ERR("invalid argument, use [on|off]");
 			return 1;
 		}
 
@@ -515,12 +516,14 @@ int Commander::custom_command(int argc, char *argv[])
 
 			} else {
 				PX4_ERR("argument %s unsupported.", argv[1]);
+				return 1;
 			}
 
 			return 0;
 
 		} else {
 			PX4_ERR("missing argument");
+			return 1;
 		}
 	}
 
@@ -551,7 +554,7 @@ int Commander::custom_command(int argc, char *argv[])
 
 		} else {
 			PX4_ERR("missing argument");
-			return 0;
+			return 1;
 		}
 	}
 
@@ -566,7 +569,7 @@ int Commander::custom_command(int argc, char *argv[])
 
 		} else {
 			PX4_ERR("missing argument");
-			return 0;
+			return 1;
 		}
 	}
 
@@ -959,7 +962,14 @@ Commander::handle_command(const vehicle_command_s &cmd)
 							desired_nav_state = vehicle_status_s::NAVIGATION_STATE_AUTO_PRECLAND;
 							break;
 
-						case PX4_CUSTOM_SUB_MODE_EXTERNAL1...PX4_CUSTOM_SUB_MODE_EXTERNAL8:
+						case PX4_CUSTOM_SUB_MODE_EXTERNAL1:
+						case PX4_CUSTOM_SUB_MODE_EXTERNAL2:
+						case PX4_CUSTOM_SUB_MODE_EXTERNAL3:
+						case PX4_CUSTOM_SUB_MODE_EXTERNAL4:
+						case PX4_CUSTOM_SUB_MODE_EXTERNAL5:
+						case PX4_CUSTOM_SUB_MODE_EXTERNAL6:
+						case PX4_CUSTOM_SUB_MODE_EXTERNAL7:
+						case PX4_CUSTOM_SUB_MODE_EXTERNAL8:
 							desired_nav_state = vehicle_status_s::NAVIGATION_STATE_EXTERNAL1 + (custom_sub_mode - PX4_CUSTOM_SUB_MODE_EXTERNAL1);
 							break;
 
