@@ -423,18 +423,23 @@ int main(int argc, char **argv)
 			commands_file = "etc/init.d-posix/rcS";
 		}
 
-		// Sister-isolation: when -i N is given but neither -w nor a platform
-		// default (PX4_INSTALL_PREFIX rootfs, PX4_BINARY_DIR/rootfs) supplied a
-		// working_directory, derive a per-instance "instance_<N>/" under the
-		// launch cwd. Without this, multiple daemons in the same cwd (a common
-		// ad-hoc / IDE launch pattern) clobber each other's parameters.bson,
-		// dataman, and log/ files: a sister daemon can boot, load another
-		// instance's saved parameters (e.g. MAV_SYS_ID), and a mavlink client
-		// connecting to the shared port can land arm/mission commands on the
-		// wrong vehicle. sitl_multiple_run.sh already does this externally;
-		// promoting it to the binary default closes the footgun for direct
-		// launches. Explicit -w still wins.
-		if (instance_provided && working_directory.empty()) {
+		// Sister-isolation: when -i N (N >= 1) is given but neither -w nor a
+		// platform default (PX4_INSTALL_PREFIX rootfs, PX4_BINARY_DIR/rootfs)
+		// supplied a working_directory, derive a per-instance "instance_<N>/"
+		// under the launch cwd. Without this, multiple daemons in the same
+		// cwd (a common ad-hoc / IDE launch pattern) clobber each other's
+		// parameters.bson, dataman, and log/ files: a sister daemon can
+		// boot, load another instance's saved parameters (e.g. MAV_SYS_ID),
+		// and a mavlink client connecting to the shared port can land
+		// arm/mission commands on the wrong vehicle. sitl_multiple_run.sh
+		// already does this externally; promoting it to the binary default
+		// closes the footgun for direct multi-instance launches.
+		//
+		// The primary instance (-i 0 or no -i) keeps the bare-cwd behavior
+		// to match the historical Linux default for single-daemon dev runs;
+		// only -i N >= 1 signals multi-instance intent. Explicit -w still
+		// wins for either case.
+		if (instance > 0 && working_directory.empty()) {
 			working_directory = "instance_" + std::to_string(instance);
 			PX4_INFO("auto work_dir: %s (use -w to override)", working_directory.c_str());
 		}
@@ -461,13 +466,28 @@ int main(int argc, char **argv)
 			if (!commands_file.empty() && !is_absolute_path(commands_file)) {
 				// Prefer rebasing onto data_path (which now is absolute) so the
 				// rcS default resolves even when the work_dir has no `etc`
-				// symlink. Fall back to launch_cwd for non-default scripts.
-				const std::string via_data = !data_path.empty()
-							     ? data_path + "/" + commands_file
-							     : std::string();
+				// symlink. data_path may itself end in /etc (the typical
+				// Windows / multi-instance launcher convention passes
+				// <build>/etc as the rootfs), in which case the default
+				// commands_file = "etc/init.d-posix/rcS" must drop its
+				// leading "etc/" before combining or the result is double-
+				// prefixed. Try the as-is form first, then the stripped form,
+				// then fall back to launch_cwd for non-default scripts.
+				const std::string as_is = !data_path.empty()
+							  ? data_path + "/" + commands_file
+							  : std::string();
 
-				if (!via_data.empty() && file_exists(via_data)) {
-					commands_file = via_data;
+				std::string stripped;
+
+				if (!data_path.empty() && commands_file.compare(0, 4, "etc/") == 0) {
+					stripped = data_path + "/" + commands_file.substr(4);
+				}
+
+				if (!as_is.empty() && file_exists(as_is)) {
+					commands_file = as_is;
+
+				} else if (!stripped.empty() && file_exists(stripped)) {
+					commands_file = stripped;
 
 				} else {
 					commands_file = launch_cwd + "/" + commands_file;
