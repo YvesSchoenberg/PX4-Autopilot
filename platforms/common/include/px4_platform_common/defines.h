@@ -53,9 +53,9 @@
 /* Define PX4_ISFINITE */
 #ifdef __cplusplus
 #if defined(_MSC_VER) && !defined(__clang__)
-#include <cmath>
-static inline bool PX4_ISFINITE(float x) { return std::isfinite(x); }
-static inline bool PX4_ISFINITE(double x) { return std::isfinite(x); }
+#include <cfloat>
+static inline constexpr bool PX4_ISFINITE(float x) { return (x >= -FLT_MAX) && (x <= FLT_MAX); }
+static inline constexpr bool PX4_ISFINITE(double x) { return (x >= -DBL_MAX) && (x <= DBL_MAX); }
 #else
 static inline constexpr bool PX4_ISFINITE(float x) { return __builtin_isfinite(x); }
 static inline constexpr bool PX4_ISFINITE(double x) { return __builtin_isfinite(x); }

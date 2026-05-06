@@ -1134,7 +1134,13 @@ void SimulatorMavlink::run()
 
 		if (bind(_fd, (struct sockaddr *)&_myaddr, sizeof(_myaddr)) < 0) {
 			PX4_ERR("bind for UDP port %i failed (%i)", _port, errno);
+#ifdef __PX4_WINDOWS
+			// Winsock SOCKETs are kernel handles, not CRT fds — using ::close()
+			// trips the UCRT _close.cpp assertion `(fh >= 0 && (unsigned)fh < (unsigned)_nhandle)`.
+			closesocket(_fd);
+#else
 			::close(_fd);
+#endif
 #if defined(ENABLE_LOCKSTEP_SCHEDULER)
 			// Unblock the lockstep wait in simulator_mavlink_main so the
 			// rest of the startup script (including shutdown) can run.
@@ -1186,7 +1192,12 @@ void SimulatorMavlink::run()
 				break;
 
 			} else {
+#ifdef __PX4_WINDOWS
+				// See note above: Winsock SOCKETs need closesocket(), not ::close().
+				closesocket(_fd);
+#else
 				::close(_fd);
+#endif
 				system_usleep(500);
 			}
 		}

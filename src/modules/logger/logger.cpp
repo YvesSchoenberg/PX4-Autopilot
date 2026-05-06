@@ -698,7 +698,7 @@ void Logger::run()
 
 		if (_writer.backend() & LogWriter::BackendFile) {
 
-			const pid_t pid_self = getpid();
+			const pid_t pid_self = px4_getpid();
 			const pthread_t writer_thread = _writer.thread_id_file();
 
 			// sched_note_start is already called from pthread_create and task_create,
