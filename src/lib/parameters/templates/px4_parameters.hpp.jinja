@@ -2,6 +2,7 @@
 
 #include <math.h> // NAN
 
+#include <array>
 #include <stdint.h>
 #include <parameters/param.h>
 
@@ -38,19 +39,15 @@ static constexpr param_type_t parameters_type[] = {
 {%- endfor -%}
 };
 
-static constexpr params parameters_volatile[] = {
-{% for param in params %}
-	{%- if param.attrib["volatile"] == "true" %}
+static constexpr std::array<params, {{ volatile_params | length }}> parameters_volatile {
+{% for param in volatile_params %}
 	params::{{ param.attrib["name"] }},
-	{%- endif -%}
 {% endfor %}
 };
 
-static constexpr params parameters_readonly[] = {
-{% for param in params %}
-	{%- if param.attrib["name"] in readonly_params %}
-	params::{{ param.attrib["name"] }},
-	{%- endif -%}
+static constexpr std::array<params, {{ readonly_param_names | length }}> parameters_readonly {
+{% for param_name in readonly_param_names %}
+	params::{{ param_name }},
 {% endfor %}
 };
 
