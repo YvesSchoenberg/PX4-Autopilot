@@ -154,6 +154,12 @@ static inline int px4_mkdir_shim(const char *path, mode_t mode)
 #ifndef S_ISLNK
 #define S_ISLNK(m) (0)
 #endif
+#ifndef S_ISDIR
+#define S_ISDIR(m) (((m) & S_IFMT) == S_IFDIR)
+#endif
+#ifndef S_ISREG
+#define S_ISREG(m) (((m) & S_IFMT) == S_IFREG)
+#endif
 #ifndef S_ISFIFO
 #define S_ISFIFO(m) (((m) & S_IFMT) == S_IFIFO)
 #endif

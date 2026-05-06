@@ -47,7 +47,15 @@
 #include <sys/types.h>
 #include <winsock2.h>
 #include <ws2tcpip.h>
+#ifndef OPTIONAL
+#define _PX4_WINDOWS_SHIM_DEFINED_OPTIONAL
+#define OPTIONAL
+#endif
 #include <mswsock.h>
+#ifdef _PX4_WINDOWS_SHIM_DEFINED_OPTIONAL
+#undef OPTIONAL
+#undef _PX4_WINDOWS_SHIM_DEFINED_OPTIONAL
+#endif
 
 #ifdef __cplusplus
 extern "C" {
@@ -98,12 +106,20 @@ struct msghdr {
 	int           msg_flags;
 };
 
-/** @brief Ancillary data header compatible with POSIX CMSG_* helpers. */
+/** @brief Ancillary data header compatible with POSIX CMSG_* helpers.
+ *
+ * MinGW's <mswsock.h> already provides `struct cmsghdr` (via `_WSACMSGHDR`)
+ * together with the CMSG_* helpers when targeting Vista+, which is always
+ * our case (_WIN32_WINNT >= 0x0A00). Use the same sentinel as the macro
+ * guards below to avoid a redefinition under MinGW while still providing
+ * the struct on platforms that omit it. */
+#ifndef CMSG_FIRSTHDR
 struct cmsghdr {
 	size_t cmsg_len;
 	int    cmsg_level;
 	int    cmsg_type;
 };
+#endif
 
 #ifndef _PX4_UCRED_DEFINED
 #define _PX4_UCRED_DEFINED
@@ -228,8 +244,10 @@ int socketpair(int domain, int type, int protocol, int socket_vector[2]);
  * @name MSVC socket wrappers
  *
  * MSVC does not expose POSIX-like int socket descriptors. These wrappers keep
- * PX4 source code using socket(), bind(), send(), etc. while centralizing
- * Winsock startup and errno translation in the Windows backend.
+ * C source code using socket(), bind(), send(), etc. while centralizing
+ * Winsock errno translation in the Windows backend. C++ has many methods named
+ * send(), connect(), and shutdown(), so C++ call sites use the declarations
+ * directly when they need an explicit wrapper.
  *
  * @{
  */
@@ -247,6 +265,7 @@ int    WSAAPI px4_windows_sendto(SOCKET s, const char *buf, int len, int flags, 
 char  *px4_windows_strerror(int e);
 /** @} */
 
+#ifndef __cplusplus
 #define socket(...)    px4_windows_socket(__VA_ARGS__)
 #define bind(...)      px4_windows_bind(__VA_ARGS__)
 #define listen(...)    px4_windows_listen(__VA_ARGS__)
@@ -259,6 +278,7 @@ char  *px4_windows_strerror(int e);
 #define recvfrom(...)  px4_windows_recvfrom(__VA_ARGS__)
 #define sendto(...)    px4_windows_sendto(__VA_ARGS__)
 #define strerror(...)  px4_windows_strerror(__VA_ARGS__)
+#endif /* !__cplusplus */
 #endif
 
 #ifdef __cplusplus

@@ -86,6 +86,17 @@ extern "C" struct if_nameindex *if_nameindex(void)
 		WideCharToMultiByte(CP_UTF8, 0, a->FriendlyName, -1, name, IF_NAMESIZE, nullptr, nullptr);
 		result[i].if_index = a->IfIndex;
 		result[i].if_name  = _strdup(name);
+
+		/* if_freenameindex() uses a NULL if_name as the array sentinel and stops
+		 * walking. A silent _strdup() failure mid-loop would truncate the iteration
+		 * and leak the remaining names; bail out instead so the caller sees ENOMEM. */
+		if (!result[i].if_name) {
+			for (unsigned int j = 0; j < i; j++) { free(result[j].if_name); }
+			free(result);
+			free(adapters);
+			errno = ENOMEM;
+			return nullptr;
+		}
 	}
 	free(adapters);
 	return result;

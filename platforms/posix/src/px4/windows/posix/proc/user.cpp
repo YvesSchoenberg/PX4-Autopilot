@@ -108,7 +108,13 @@ static int align_buf(char **cursor, size_t *remaining, size_t alignment)
 static struct passwd *fill_passwd()
 {
 	DWORD n = sizeof(_pw_name);
-	if (!GetUserNameA(_pw_name, &n)) { strcpy(_pw_name, "px4"); }
+	if (!GetUserNameA(_pw_name, &n)) {
+		/* GetUserNameA failed; fall back to a stable placeholder. Use a bounded
+		 * copy rather than strcpy() so MSVC does not flag the deprecated CRT
+		 * API and we cannot accidentally overflow if _pw_name shrinks later. */
+		strncpy(_pw_name, "px4", sizeof(_pw_name) - 1);
+		_pw_name[sizeof(_pw_name) - 1] = '\0';
+	}
 	const char *home = getenv("USERPROFILE");
 	if (!home) { home = "C:\\"; }
 	strncpy(_pw_dir, home, sizeof(_pw_dir) - 1);
