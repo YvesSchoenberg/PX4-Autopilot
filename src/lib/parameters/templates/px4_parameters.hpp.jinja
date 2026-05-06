@@ -23,11 +23,10 @@ enum class params : uint16_t {
 static constexpr param_info_s parameters[] = {
 {% for param in params %}
 	{
-		.name = "{{ param.attrib["name"] }}",
 	{%- if param.attrib["type"] == "FLOAT" %}
-		.val = {{ "{" }} .f = {{ param.attrib["default"] }} {{ "}" }},
+		"{{ param.attrib["name"] }}", param_value_u{static_cast<float>({{ param.attrib["default"] }})},
 	{%- elif param.attrib["type"] == "INT32" %}
-		.val = {{ "{" }} .i = {{ param.attrib["default"] }}{{ "}" }},
+		"{{ param.attrib["name"] }}", param_value_u{static_cast<int32_t>({{ param.attrib["default"] }})},
 	{%- endif %}
 	},
 {% endfor %}
