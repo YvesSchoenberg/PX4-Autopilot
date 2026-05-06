@@ -51,6 +51,10 @@
 #include <drivers/drv_pwm_output.h>         // to get PWM flags
 #include <lib/drivers/device/Device.hpp>
 
+#if defined(__PX4_WINDOWS) || defined(_WIN32)
+#include <windows.h>
+#endif
+
 using namespace math;
 using namespace matrix;
 using namespace time_literals;
@@ -71,6 +75,19 @@ Sih::~Sih()
 
 void Sih::run()
 {
+#if defined(__PX4_WINDOWS) || defined(_WIN32)
+	// SIH is the lockstep producer: it advances simulated time and
+	// signals every consumer waiting on the next sim_time tick. On
+	// Windows the default thread priority lets unrelated host
+	// background threads (Defender, Search, telemetry) preempt this
+	// loop, which shows up as sim/wall drift under load. Raise the
+	// producer to ABOVE_NORMAL so the OS scheduler keeps it on-CPU
+	// long enough to publish the next tick. ABOVE_NORMAL is enough
+	// to outrank typical host noise without starving driver/IO
+	// threads, which TIME_CRITICAL or HIGHEST risk on a busy host.
+	(void)SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
+#endif
+
 	_px4_accel.set_temperature(T1_C);
 	_px4_gyro.set_temperature(T1_C);
 
@@ -244,7 +261,8 @@ void Sih::sensor_step()
 		parameters_updated();
 	}
 
-	perf_begin(_loop_perf);
+	// Note: _loop_perf is wrapped by the calling loop (realtime_loop / lockstep_loop),
+	// do not call perf_begin/perf_end here or the counter is double-counted per tick.
 
 	const hrt_abstime now = hrt_absolute_time();
 	const float dt = (now - _last_run) * 1e-6f;
@@ -280,8 +298,6 @@ void Sih::sensor_step()
 	}
 
 	publish_ground_truth(now);
-
-	perf_end(_loop_perf);
 }
 
 void Sih::parameters_updated()
@@ -353,7 +369,7 @@ void Sih::parameters_updated()
 	_I(1, 2) = _I(2, 1) = _sih_iyz.get();
 
 	// guards against too small determinants
-	_Im1 = 100.0f * inv(static_cast<typeof _I>(100.0f * _I));
+	_Im1 = 100.0f * inv(static_cast<decltype(_I)>(100.0f * _I));
 
 	_distance_snsr_min = _sih_distance_snsr_min.get();
 	_distance_snsr_max = _sih_distance_snsr_max.get();
