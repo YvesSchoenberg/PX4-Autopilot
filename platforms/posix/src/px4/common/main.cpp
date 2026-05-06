@@ -76,6 +76,12 @@
 static inline unsigned int geteuid(void) { return 1000; }
 #endif
 
+#if defined(_MSC_VER)
+// MSVC CRT debug heap: dumps unfreed allocations to stderr at process exit.
+// Only active in Debug builds linked against the debug CRT (/MDd or /MTd).
+#include <crtdbg.h>
+#endif
+
 #include <px4_platform_common/time.h>
 #include <px4_platform_common/log.h>
 #include <px4_platform_common/init.h>
@@ -92,7 +98,9 @@ static inline unsigned int geteuid(void) { return 1000; }
 
 #define MODULE_NAME "px4"
 
+#ifndef __PX4_WINDOWS
 static const char *LOCK_FILE_PATH = "/tmp/px4_lock";
+#endif
 
 #ifndef PATH_MAX
 #define PATH_MAX 1024
@@ -101,6 +109,18 @@ static const char *LOCK_FILE_PATH = "/tmp/px4_lock";
 
 static volatile bool _exit_requested = false;
 static volatile sig_atomic_t _shutdown_started = 0;
+
+#ifdef __PX4_WINDOWS
+// Stashed by set_server_running() so that sig_int_handler() can close the
+// byte-range lock fd and unlink the lock + .pid files before Windows' ~5s
+// CTRL_CLOSE/LOGOFF/SHUTDOWN grace expires and TerminateProcess fires.
+// Without this, a fast logoff/shutdown would race the registered exit
+// unlinks at px4_windows_exit() and leave %TEMP%\px4_lock-<N> behind for
+// the next launch's stale-lock recovery to mop up.
+static volatile int _lock_fd_for_signal = -1;
+static char _lock_path_for_signal[MAX_PATH + 1] = {0};
+static char _pid_path_for_signal[MAX_PATH + 1] = {0};
+#endif
 
 
 namespace px4
@@ -117,6 +137,7 @@ static int create_dirs();
 static int run_startup_script(const std::string &commands_file, const std::string &absolute_binary_path, int instance);
 static std::string get_absolute_binary_path(const std::string &argv0);
 static void wait_to_exit();
+static std::string get_lock_file_path(int instance);
 static int get_server_running(int instance, bool *is_running);
 static int set_server_running(int instance);
 static void print_usage();
@@ -195,6 +216,19 @@ int SITL_MAIN(int argc, char **argv)
 int main(int argc, char **argv)
 #endif
 {
+#if defined(_MSC_VER)
+	// Enable CRT debug heap allocation tracking and at-exit leak dump.
+	// _CRTDBG_LEAK_CHECK_DF causes _CrtDumpMemoryLeaks() to run automatically
+	// on process exit; output is routed to stderr.
+	_CrtSetDbgFlag(_CRTDBG_ALLOC_MEM_DF | _CRTDBG_LEAK_CHECK_DF);
+	_CrtSetReportMode(_CRT_WARN, _CRTDBG_MODE_FILE);
+	_CrtSetReportFile(_CRT_WARN, _CRTDBG_FILE_STDERR);
+	_CrtSetReportMode(_CRT_ERROR, _CRTDBG_MODE_FILE);
+	_CrtSetReportFile(_CRT_ERROR, _CRTDBG_FILE_STDERR);
+	_CrtSetReportMode(_CRT_ASSERT, _CRTDBG_MODE_FILE);
+	_CrtSetReportFile(_CRT_ASSERT, _CRTDBG_FILE_STDERR);
+#endif
+
 	bool is_client = false;
 	bool pxh_off = false;
 	bool server_is_running = false;
@@ -279,12 +313,13 @@ int main(int argc, char **argv)
 		bool working_directory_default = false;
 
 		bool instance_provided = false;
+		bool clean_params_requested = false;
 
 		int myoptind = 1;
 		int ch;
 		const char *myoptarg = nullptr;
 
-		while ((ch = px4_getopt(argc, argv, "hdt:s:i:w:", &myoptind, &myoptarg)) != EOF) {
+		while ((ch = px4_getopt(argc, argv, "hdct:s:i:w:", &myoptind, &myoptarg)) != EOF) {
 			switch (ch) {
 			case 'h':
 				print_usage();
@@ -292,6 +327,10 @@ int main(int argc, char **argv)
 
 			case 'd':
 				pxh_off = true;
+				break;
+
+			case 'c':
+				clean_params_requested = true;
 				break;
 
 			case 't':
@@ -384,6 +423,58 @@ int main(int argc, char **argv)
 			commands_file = "etc/init.d-posix/rcS";
 		}
 
+		// Sister-isolation: when -i N is given but neither -w nor a platform
+		// default (PX4_INSTALL_PREFIX rootfs, PX4_BINARY_DIR/rootfs) supplied a
+		// working_directory, derive a per-instance "instance_<N>/" under the
+		// launch cwd. Without this, multiple daemons in the same cwd (a common
+		// ad-hoc / IDE launch pattern) clobber each other's parameters.bson,
+		// dataman, and log/ files: a sister daemon can boot, load another
+		// instance's saved parameters (e.g. MAV_SYS_ID), and a mavlink client
+		// connecting to the shared port can land arm/mission commands on the
+		// wrong vehicle. sitl_multiple_run.sh already does this externally;
+		// promoting it to the binary default closes the footgun for direct
+		// launches. Explicit -w still wins.
+		if (instance_provided && working_directory.empty()) {
+			working_directory = "instance_" + std::to_string(instance);
+			PX4_INFO("auto work_dir: %s (use -w to override)", working_directory.c_str());
+		}
+
+		// Anchor user-supplied relative paths to the launch cwd whenever we are
+		// about to chdir, so the post-chdir resolution still finds them. This
+		// covers both the auto-work_dir case above and explicit -w <work_dir>
+		// (which previously left data_path / commands_file cwd-relative and
+		// broke the rcS lookup on Windows when the convenience `etc` symlink
+		// fell back to PX4_OK without actually creating the link — see
+		// create_symlinks_if_needed's EPERM/EACCES branch). Absolute paths and
+		// the platform defaults (already absolute) pass through unchanged.
+		if (!working_directory.empty()) {
+			const std::string launch_cwd = pwd();
+
+			if (!data_path.empty() && !is_absolute_path(data_path)) {
+				data_path = launch_cwd + "/" + data_path;
+			}
+
+			if (!test_data_path.empty() && !is_absolute_path(test_data_path)) {
+				test_data_path = launch_cwd + "/" + test_data_path;
+			}
+
+			if (!commands_file.empty() && !is_absolute_path(commands_file)) {
+				// Prefer rebasing onto data_path (which now is absolute) so the
+				// rcS default resolves even when the work_dir has no `etc`
+				// symlink. Fall back to launch_cwd for non-default scripts.
+				const std::string via_data = !data_path.empty()
+							     ? data_path + "/" + commands_file
+							     : std::string();
+
+				if (!via_data.empty() && file_exists(via_data)) {
+					commands_file = via_data;
+
+				} else {
+					commands_file = launch_cwd + "/" + commands_file;
+				}
+			}
+		}
+
 		// change the CWD befre setting up links and other directories
 		if (!working_directory.empty()) {
 
@@ -397,6 +488,22 @@ int main(int argc, char **argv)
 
 			if (ret != PX4_OK) {
 				return ret;
+			}
+		}
+
+		// -c / --clean-params: wipe cached param state from a previous run before
+		// the startup script triggers param load. Without this, a stale
+		// parameters.bson in the (per-instance) work_dir silently overrides any
+		// `param set-default` in the airframe — verification recipes end up
+		// testing the OLD tuning. Opt-in: a normal start preserves saved params.
+		if (clean_params_requested) {
+			PX4_INFO("Clearing cached param state (-c flag)");
+			const char *cached[] = {"parameters.bson", "parameters_backup.bson"};
+
+			for (const char *f : cached) {
+				if (file_exists(f) && unlink(f) != 0) {
+					PX4_WARN("failed to unlink %s: %s", f, strerror(errno));
+				}
 			}
 		}
 
@@ -426,7 +533,18 @@ int main(int argc, char **argv)
 				ret = symlink(test_data_path.c_str(), required_test_data_path.c_str());
 
 				if (ret != PX4_OK) {
-					return ret;
+#ifdef __PX4_WINDOWS
+					// See create_symlinks_if_needed(): symlink creation may require
+					// Developer Mode / admin on Windows. Treat EACCES/EPERM as
+					// non-fatal — tests that need test_data must use the absolute
+					// path; the convenience link is best-effort.
+					if (errno == EACCES || errno == EPERM) {
+						PX4_INFO("symlink %s -> %s not supported (errno=%d), skipping",
+							 test_data_path.c_str(), required_test_data_path.c_str(), errno);
+
+					} else
+#endif
+						return ret;
 				}
 			}
 		}
@@ -472,7 +590,7 @@ int main(int argc, char **argv)
 		}
 
 		// delete lock
-		const std::string file_lock_path = std::string(LOCK_FILE_PATH) + '-' + std::to_string(instance);
+		const std::string file_lock_path = get_lock_file_path(instance);
 		int fd_flock = open(file_lock_path.c_str(), O_RDWR, 0666);
 
 		if (fd_flock >= 0) {
@@ -480,6 +598,11 @@ int main(int argc, char **argv)
 			flock(fd_flock, LOCK_UN);
 			close(fd_flock);
 		}
+
+#ifdef __PX4_WINDOWS
+		// also remove the companion PID file used for stale-lock detection
+		unlink((file_lock_path + ".pid").c_str());
+#endif
 
 		if (ret != 0) {
 			return PX4_ERROR;
@@ -548,6 +671,19 @@ int create_symlinks_if_needed(std::string &data_path)
 	int ret = symlink(src_path.c_str(), dest_path.c_str());
 
 	if (ret != 0) {
+#ifdef __PX4_WINDOWS
+		// On Windows, creating symlinks requires admin rights, Developer Mode
+		// (Win10 1703+), or SE_CREATE_SYMBOLIC_LINK_PRIVILEGE. The windows_shim
+		// symlink() already falls back to hard links / recursive copy, but if
+		// that also fails (EACCES/EPERM), don't kill PX4: the rest of the boot
+		// uses data_path directly. The cwd/etc convenience link is just that.
+		if (errno == EACCES || errno == EPERM) {
+			PX4_INFO("symlink %s -> %s not supported (errno=%d), using data_path directly",
+				 src_path.c_str(), dest_path.c_str(), errno);
+			return PX4_OK;
+		}
+
+#endif
 		PX4_ERR("Error creating symlink %s -> %s", src_path.c_str(), dest_path.c_str());
 		return ret;
 
@@ -634,6 +770,23 @@ void sig_int_handler(int sig_num)
 	fflush(stdout);
 #ifdef __PX4_WINDOWS
 	prepare_console_for_host_shell();
+
+	// Best-effort lock-file cleanup before Windows' ~5s grace expires for
+	// CTRL_CLOSE/LOGOFF/SHUTDOWN. The registered exit unlinks at
+	// px4_windows_exit() are the primary cleanup path; this is a backstop
+	// for the case where the OS force-kills us before that path runs.
+	// Order matters: Windows blocks unlink() while a handle is open in the
+	// same process, so close the byte-range lock fd first.
+	if (_lock_fd_for_signal >= 0) {
+		close(_lock_fd_for_signal);
+		_lock_fd_for_signal = -1;
+	}
+	if (_lock_path_for_signal[0]) {
+		unlink(_lock_path_for_signal);
+	}
+	if (_pid_path_for_signal[0]) {
+		unlink(_pid_path_for_signal);
+	}
 #endif
 	uorb_shutdown();
 	px4_daemon::Pxh::stop();
@@ -702,7 +855,7 @@ void print_usage()
 {
 	printf("Usage for Server/daemon process: \n");
 	printf("\n");
-	printf("    px4 [-h|-d] [-s <startup_file>] [-t <test_data_directory>] [<rootfs_directory>] [-i <instance>] [-w <working_directory>]\n");
+	printf("    px4 [-h|-d|-c] [-s <startup_file>] [-t <test_data_directory>] [<rootfs_directory>] [-i <instance>] [-w <working_directory>]\n");
 	printf("\n");
 	printf("    -s <startup_file>      shell script to be used as startup (default=etc/init.d-posix/rcS)\n");
 	printf("    <rootfs_directory>     directory where startup files and mixers are located,\n");
@@ -711,6 +864,9 @@ void print_usage()
 	printf("    -w <working_directory> directory to change to\n");
 	printf("    -h                     help/usage information\n");
 	printf("    -d                     daemon mode, don't start pxh shell\n");
+	printf("    -c                     clean cached param state (parameters.bson) before boot;\n");
+	printf("                           use to verify airframe `param set-default` values without\n");
+	printf("                           a previous run's saved params shadowing them (dev/test)\n");
 	printf("\n");
 	printf("Usage for client: \n");
 	printf("\n");
@@ -718,9 +874,26 @@ void print_usage()
 	printf("        e.g.: px4-commander status\n");
 }
 
+std::string get_lock_file_path(int instance)
+{
+#ifdef __PX4_WINDOWS
+	char temp_path[MAX_PATH + 1] {};
+	const DWORD temp_path_length = GetTempPathA(sizeof(temp_path), temp_path);
+	std::string lock_dir = (temp_path_length > 0 && temp_path_length < sizeof(temp_path)) ? temp_path : pwd();
+
+	while (!lock_dir.empty() && is_path_separator(lock_dir.back())) {
+		lock_dir.pop_back();
+	}
+
+	return lock_dir + "\\px4_lock-" + std::to_string(instance);
+#else
+	return std::string(LOCK_FILE_PATH) + '-' + std::to_string(instance);
+#endif
+}
+
 int get_server_running(int instance, bool *is_server_running)
 {
-	const std::string file_lock_path = std::string(LOCK_FILE_PATH) + '-' + std::to_string(instance);
+	const std::string file_lock_path = get_lock_file_path(instance);
 	int fd = open(file_lock_path.c_str(), O_RDWR | O_CREAT, 0666);
 
 	if (fd < 0) {
@@ -751,6 +924,70 @@ int get_server_running(int instance, bool *is_server_running)
 		}
 	}
 
+#ifdef __PX4_WINDOWS
+
+	// Stale-lock recovery on Windows: a hard kill (taskkill /F, Stop-Process
+	// -Force) releases the byte-range lock that the kernel holds on behalf
+	// of the process, but the lock file itself survives in %TEMP%. The
+	// existing byte-range check above already reports F_UNLCK in that case
+	// (the kernel released the lock), so the stale file would otherwise
+	// look "free" -- we just need to remove it so set_server_running can
+	// recreate it cleanly. When the lock IS held, cross-check the recorded
+	// holder PID stored in a side file: if that PID is gone (e.g. the
+	// holding process was force-killed but the kernel hasn't fully torn
+	// down the handle yet, or a child briefly held the lock), treat the
+	// lock as stale.
+	if (status == PX4_OK) {
+		const std::string pid_path = file_lock_path + ".pid";
+		DWORD recorded_pid = 0;
+		FILE *pf = fopen(pid_path.c_str(), "r");
+
+		if (pf) {
+			char buf[32] = {0};
+
+			if (fgets(buf, sizeof(buf), pf)) {
+				recorded_pid = (DWORD)strtoul(buf, nullptr, 10);
+			}
+
+			fclose(pf);
+		}
+
+		bool process_alive = false;
+
+		if (recorded_pid != 0) {
+			HANDLE h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, recorded_pid);
+
+			if (h != nullptr) {
+				DWORD exit_code = 0;
+
+				if (GetExitCodeProcess(h, &exit_code) && exit_code == STILL_ACTIVE) {
+					process_alive = true;
+				}
+
+				CloseHandle(h);
+			}
+		}
+
+		if (!process_alive) {
+			// No live holder: drop any stale files so set_server_running
+			// can recreate them cleanly. Safe regardless of *is_server_running:
+			// if the byte-range check above reported the lock free, the file
+			// is just leftover bytes from a previous run; if it reported the
+			// lock held, the kernel will keep enforcing it for whoever still
+			// has the handle while we just drop the now-unrelated PID file.
+			close(fd);
+			unlink(pid_path.c_str());
+
+			if (!*is_server_running) {
+				unlink(file_lock_path.c_str());
+			}
+
+			return PX4_OK;
+		}
+	}
+
+#endif // __PX4_WINDOWS
+
 	close(fd);
 
 	return status;
@@ -758,7 +995,7 @@ int get_server_running(int instance, bool *is_server_running)
 
 int set_server_running(int instance)
 {
-	const std::string file_lock_path = std::string(LOCK_FILE_PATH) + '-' + std::to_string(instance);
+	const std::string file_lock_path = get_lock_file_path(instance);
 	int fd = open(file_lock_path.c_str(), O_RDWR | O_CREAT, 0666);
 
 	if (fd < 0) {
@@ -780,6 +1017,45 @@ int set_server_running(int instance)
 		status = PX4_ERROR;
 		close(fd);
 	}
+
+#ifdef __PX4_WINDOWS
+
+	// Record the holder PID in a companion file so that a subsequent
+	// launch can detect a stale lock left behind by a forced kill. The
+	// PID lives outside the lock file because Windows' mandatory
+	// byte-range lock would otherwise block readers from inspecting the
+	// PID while the lock is held.
+	if (status == PX4_OK) {
+		const std::string pid_path = file_lock_path + ".pid";
+		FILE *pf = fopen(pid_path.c_str(), "w");
+
+		if (pf) {
+			fprintf(pf, "%lu\n", (unsigned long)GetCurrentProcessId());
+			fclose(pf);
+		}
+
+		// Register both the byte-range lock file and its PID companion
+		// for unlink at process exit. Required because the graceful
+		// `pxh shutdown` path leaves through px4_platform_exit() ->
+		// ExitProcess(), bypassing the explicit cleanup at the bottom
+		// of main(). Without this, %TEMP% accumulates stale px4_lock-*
+		// files that the next launch then has to recover from.
+		// Also queue the lock fd for close: Windows blocks unlink() while
+		// the handle is open in the same process, so without closing it
+		// first the lock file (but not the .pid) would leak.
+		px4_windows_register_exit_close_fd(fd);
+		px4_windows_register_exit_unlink(file_lock_path.c_str());
+		px4_windows_register_exit_unlink(pid_path.c_str());
+
+		// Mirror into static buffers so sig_int_handler() can do best-effort
+		// cleanup before Windows' ~5s CTRL_CLOSE/LOGOFF/SHUTDOWN grace runs
+		// out and TerminateProcess preempts the registered exit unlinks.
+		_lock_fd_for_signal = fd;
+		strncpy(_lock_path_for_signal, file_lock_path.c_str(), sizeof(_lock_path_for_signal) - 1);
+		strncpy(_pid_path_for_signal,  pid_path.c_str(),       sizeof(_pid_path_for_signal)  - 1);
+	}
+
+#endif // __PX4_WINDOWS
 
 	// note: server leaks the file handle, on purpose, in order to keep the lock on the file until the process terminates.
 	// In this case we return false so the server code path continues now that we have the lock.

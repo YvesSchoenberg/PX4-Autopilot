@@ -79,6 +79,33 @@ void px4_windows_release_console(void);
  */
 void px4_windows_exit(int status) noreturn_function;
 
+/**
+ * @brief Queue a filesystem path to unlink during px4_windows_exit().
+ *
+ * The graceful `pxh shutdown` path on Windows ends in ExitProcess(), which
+ * skips the explicit lock-file cleanup at the bottom of main(). Anything that
+ * must survive only as long as the process lives (server lock file, PID
+ * companion file, ...) should be registered here so the exit hook unlinks it
+ * regardless of the shutdown route taken.
+ *
+ * Best-effort: silently drops paths if the internal slot table is full, and
+ * silently ignores unlink failures. Idempotent for repeated registrations of
+ * the same path.
+ */
+void px4_windows_register_exit_unlink(const char *path);
+
+/**
+ * @brief Queue a file descriptor to close BEFORE the registered unlinks run.
+ *
+ * Windows refuses to unlink a file while any handle to it is open in the same
+ * process (ERROR_SHARING_VIOLATION). The byte-range lock fd installed by
+ * set_server_running() is intentionally leaked for the lifetime of the
+ * daemon, so the exit hook must close it first or the corresponding lock
+ * file would leak in %TEMP%. Idempotent for repeated registrations of the
+ * same fd. Negative fds are ignored.
+ */
+void px4_windows_register_exit_close_fd(int fd);
+
 #ifdef __cplusplus
 }
 #endif
