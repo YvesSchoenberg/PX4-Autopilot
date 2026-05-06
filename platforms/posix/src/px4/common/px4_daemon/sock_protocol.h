@@ -40,10 +40,17 @@
 #include <cstdint>
 #include <string>
 
+#ifdef __PX4_WINDOWS
+#include <winsock2.h>
+#endif
+
 namespace px4_daemon
 {
 
 #ifdef __PX4_WINDOWS
+using socket_handle_t = SOCKET;
+static constexpr socket_handle_t invalid_socket_handle = INVALID_SOCKET;
+
 // Windows: AF_INET TCP loopback. AF_UNIX was introduced in Windows 10 1803
 // (WinSock2) and in principle would work, but Wine (used for SITL CI) did
 // not support AF_UNIX until 7.x — 6.x still returns WSAEAFNOSUPPORT. TCP
@@ -51,6 +58,8 @@ namespace px4_daemon
 // daemon protocol.
 uint16_t get_socket_port(int instance_id);
 #else
+using socket_handle_t = int;
+static constexpr socket_handle_t invalid_socket_handle = -1;
 std::string get_socket_path(int instance_id);
 #endif
 
