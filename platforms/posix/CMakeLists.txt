@@ -72,9 +72,10 @@ if (BUILD_TESTING)
 			${_px4_posix_math_libraries}
 			parameters
 	)
-	target_compile_options(mavlink_fuzz_tests
+	px4_target_compile_options_for_compiler(mavlink_fuzz_tests
 		PRIVATE
-			# There warnings come from within fuzztest
+			GNU_LIKE
+			# These warnings come from within fuzztest
 			-Wno-float-equal
 			-Wno-sign-compare
 			-Wno-shadow

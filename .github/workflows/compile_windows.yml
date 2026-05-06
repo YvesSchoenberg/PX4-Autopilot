@@ -90,7 +90,11 @@ jobs:
         shell: pwsh
         run: |
           python -m pip install --upgrade pip
-          python -m pip install jinja2 pyyaml toml numpy packaging jsonschema future empy pyros-genmsg
+          # empy pinned <4: PX4's msg/uxrce_dds/flight_tasks/zenoh generators
+          # use the empy 3.x Interpreter(...options={em.RAW_OPT: True,
+          # em.BUFFERED_OPT: True}) API removed in empy 4.x. Matches the pin
+          # in Tools/setup/requirements.txt and Tools/setup/windows.ps1.
+          python -m pip install jinja2 pyyaml toml numpy packaging jsonschema future "empy>=3.3,<4" pyros-genmsg kconfiglib
 
       - name: Install Ninja (MSVC)
         if: matrix.toolchain == 'MSVC'

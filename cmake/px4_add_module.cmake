@@ -91,6 +91,22 @@ function(px4_add_module)
 		REQUIRED MODULE MAIN
 		ARGN ${ARGN})
 
+	set(MODULE_COMPILE_FLAGS ${COMPILE_FLAGS})
+
+	if(MSVC AND MODULE_COMPILE_FLAGS)
+		set(MODULE_COMPILE_FLAGS_FILTERED)
+		px4_msvc_compile_options_from_gnu(MODULE_COMPILE_FLAGS_MSVC ${MODULE_COMPILE_FLAGS})
+
+		foreach(flag IN LISTS MODULE_COMPILE_FLAGS)
+			if(NOT flag MATCHES "^-W")
+				list(APPEND MODULE_COMPILE_FLAGS_FILTERED "${flag}")
+			endif()
+		endforeach()
+
+		list(APPEND MODULE_COMPILE_FLAGS_FILTERED ${MODULE_COMPILE_FLAGS_MSVC})
+		set(MODULE_COMPILE_FLAGS ${MODULE_COMPILE_FLAGS_FILTERED})
+	endif()
+
 	if(UNITY_BUILD AND (${PX4_PLATFORM} STREQUAL "nuttx"))
 		# build standalone test library to catch compilation errors and provide sane output
 		add_library(${MODULE}_original STATIC EXCLUDE_FROM_ALL ${SRCS})
@@ -117,8 +133,8 @@ function(px4_add_module)
 		target_include_directories(${MODULE} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 		add_dependencies(${MODULE} ${MODULE}_original) # build standalone module first to get clean compile errors
 
-		if(COMPILE_FLAGS)
-			target_compile_options(${MODULE}_original PRIVATE ${COMPILE_FLAGS})
+		if(MODULE_COMPILE_FLAGS)
+			target_compile_options(${MODULE}_original PRIVATE ${MODULE_COMPILE_FLAGS})
 		endif()
 
 		if(DEPENDS)
@@ -229,8 +245,8 @@ function(px4_add_module)
 		message(FATAL_ERROR "MAIN required")
 	endif()
 
-	if(COMPILE_FLAGS)
-		target_compile_options(${MODULE} PRIVATE ${COMPILE_FLAGS})
+	if(MODULE_COMPILE_FLAGS)
+		target_compile_options(${MODULE} PRIVATE ${MODULE_COMPILE_FLAGS})
 	endif()
 
 	if (KERNEL)

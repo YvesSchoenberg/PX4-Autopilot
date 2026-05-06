@@ -38,6 +38,9 @@
 
 set(PX4_POSIX_WINDOWS_ROOT "${PX4_SOURCE_DIR}/platforms/posix/src/px4/windows")
 set(PX4_POSIX_WINDOWS_PRIVATE_INCLUDE_DIR "${PX4_POSIX_WINDOWS_ROOT}/include")
+set(PX4_POSIX_WINDOWS_DYNAMIC_MODULE_HOST_EXPORTS
+	px4_log_modulename
+)
 
 function(px4_posix_windows_append_sources out_var)
 	list(APPEND ${out_var}
@@ -109,6 +112,20 @@ function(px4_posix_windows_configure_target target_name)
 	if(MSVC)
 		set_target_properties(${target_name} PROPERTIES WINDOWS_EXPORT_ALL_SYMBOLS ON)
 		target_compile_options(${target_name} PRIVATE /bigobj)
+
+		# Reproducible builds: zero out the PE COFF TimeDateStamp and the debug
+		# directory timestamp so byte-identical sources produce a byte-identical
+		# px4.exe. Without /Brepro every link embeds time(NULL), making CI
+		# artifact diffing and supply-chain hashing meaningless.
+		target_compile_options(${target_name} PRIVATE /Brepro)
+		target_link_options(${target_name} PRIVATE /Brepro)
+
+		# WINDOWS_EXPORT_ALL_SYMBOLS only scans objects owned directly by
+		# px4.exe. Dynamic .px4mod modules also need host APIs that come from
+		# PX4 static libraries, so export those entry points explicitly.
+		foreach(host_export IN LISTS PX4_POSIX_WINDOWS_DYNAMIC_MODULE_HOST_EXPORTS)
+			target_link_options(${target_name} PRIVATE "/EXPORT:${host_export}")
+		endforeach()
 	else()
 		# Force an import library (`libpx4.dll.a`) to be generated alongside
 		# px4.exe so DYNAMIC `.px4mod` modules can link against it.
@@ -149,6 +166,7 @@ function(px4_posix_windows_link_libraries target_name)
 			iphlpapi
 			dbghelp
 			psapi
+			winmm    # timeBeginPeriod / timeEndPeriod for 1 ms timer resolution
 	)
 
 	if(NOT MSVC)

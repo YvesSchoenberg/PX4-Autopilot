@@ -356,7 +356,7 @@ if(EXISTS ${BOARD_DEFCONFIG})
 
 	if(CONSTRAINED_FLASH)
 		set(px4_constrained_flash_build "1" CACHE INTERNAL "constrained flash build" FORCE)
-		add_definitions(-DCONSTRAINED_FLASH)
+		add_definitions(-DCONSTRAINED_FLASH=1)
 	endif()
 
 	if(NO_HELP)
@@ -378,7 +378,7 @@ if(EXISTS ${BOARD_DEFCONFIG})
 
 	if(CRYPTO)
 		set(PX4_CRYPTO "1" CACHE INTERNAL "PX4 crypto implementation" FORCE)
-		add_definitions(-DPX4_CRYPTO)
+		add_definitions(-DPX4_CRYPTO=1)
 	endif()
 
 	if(LINKER_PREFIX)

@@ -20,16 +20,66 @@ set(CMAKE_SYSTEM_PROCESSOR x86_64)
 
 set(TOOLCHAIN_PREFIX x86_64-w64-mingw32)
 
-find_program(MINGW_C_COMPILER NAMES ${TOOLCHAIN_PREFIX}-gcc-posix ${TOOLCHAIN_PREFIX}-gcc)
-find_program(MINGW_CXX_COMPILER NAMES ${TOOLCHAIN_PREFIX}-g++-posix ${TOOLCHAIN_PREFIX}-g++)
-find_program(MINGW_RC_COMPILER NAMES ${TOOLCHAIN_PREFIX}-windres)
-find_program(MINGW_AR          NAMES ${TOOLCHAIN_PREFIX}-ar)
-find_program(MINGW_RANLIB      NAMES ${TOOLCHAIN_PREFIX}-ranlib)
+set(MINGW_SEARCH_PATHS)
 
-if(NOT MINGW_C_COMPILER OR NOT MINGW_CXX_COMPILER)
-	message(FATAL_ERROR
-		"MinGW-w64 (${TOOLCHAIN_PREFIX}) not found. "
-		"Install with: apt-get install mingw-w64 g++-mingw-w64-x86-64-posix gcc-mingw-w64-x86-64-posix")
+if(CMAKE_HOST_WIN32)
+	list(APPEND MINGW_SEARCH_PATHS
+		"$ENV{MINGW_PREFIX}/bin"
+		"C:/msys64/mingw64/bin")
+endif()
+
+find_program(MINGW_REAL_C_COMPILER NAMES ${TOOLCHAIN_PREFIX}-gcc-posix ${TOOLCHAIN_PREFIX}-gcc HINTS ${MINGW_SEARCH_PATHS})
+find_program(MINGW_REAL_CXX_COMPILER NAMES ${TOOLCHAIN_PREFIX}-g++-posix ${TOOLCHAIN_PREFIX}-g++ HINTS ${MINGW_SEARCH_PATHS})
+find_program(MINGW_REAL_RC_COMPILER NAMES ${TOOLCHAIN_PREFIX}-windres HINTS ${MINGW_SEARCH_PATHS})
+find_program(MINGW_AR NAMES ${TOOLCHAIN_PREFIX}-ar HINTS ${MINGW_SEARCH_PATHS})
+find_program(MINGW_RANLIB NAMES ${TOOLCHAIN_PREFIX}-ranlib HINTS ${MINGW_SEARCH_PATHS})
+
+if(NOT MINGW_REAL_C_COMPILER OR NOT MINGW_REAL_CXX_COMPILER)
+	if(CMAKE_HOST_WIN32)
+		message(FATAL_ERROR
+			"MinGW-w64 (${TOOLCHAIN_PREFIX}) not found. "
+			"Install the MSYS2 mingw-w64-x86_64 toolchain and add the MinGW bin directory "
+			"(for example C:/msys64/mingw64/bin) to PATH.")
+	else()
+		message(FATAL_ERROR
+			"MinGW-w64 (${TOOLCHAIN_PREFIX}) not found. "
+			"Install with: apt-get install mingw-w64 g++-mingw-w64-x86-64-posix gcc-mingw-w64-x86-64-posix")
+	endif()
+endif()
+
+get_filename_component(MINGW_BIN_DIR "${MINGW_REAL_C_COMPILER}" DIRECTORY)
+
+if(CMAKE_HOST_WIN32)
+	# The GCC driver is enough to locate cc1/ld, but child tools still need
+	# the MinGW DLLs from the same bin directory.
+	set(ENV{PATH} "${MINGW_BIN_DIR};$ENV{PATH}")
+
+	set(MINGW_WRAPPER_DIR "${CMAKE_BINARY_DIR}/mingw_toolchain")
+	set(MINGW_WRAPPER_PATH "${MINGW_BIN_DIR};%SystemRoot%/system32;%SystemRoot%;%SystemRoot%/System32/Wbem")
+	file(MAKE_DIRECTORY "${MINGW_WRAPPER_DIR}")
+	file(WRITE "${MINGW_WRAPPER_DIR}/gcc.cmd"
+		"@echo off\r\n"
+		"set \"PATH=${MINGW_WRAPPER_PATH}\"\r\n"
+		"\"${MINGW_REAL_C_COMPILER}\" %*\r\n"
+		"exit /b %ERRORLEVEL%\r\n")
+	file(WRITE "${MINGW_WRAPPER_DIR}/gxx.cmd"
+		"@echo off\r\n"
+		"set \"PATH=${MINGW_WRAPPER_PATH}\"\r\n"
+		"\"${MINGW_REAL_CXX_COMPILER}\" %*\r\n"
+		"exit /b %ERRORLEVEL%\r\n")
+	file(WRITE "${MINGW_WRAPPER_DIR}/windres.cmd"
+		"@echo off\r\n"
+		"set \"PATH=${MINGW_WRAPPER_PATH}\"\r\n"
+		"\"${MINGW_REAL_RC_COMPILER}\" %*\r\n"
+		"exit /b %ERRORLEVEL%\r\n")
+
+	set(MINGW_C_COMPILER "${MINGW_WRAPPER_DIR}/gcc.cmd")
+	set(MINGW_CXX_COMPILER "${MINGW_WRAPPER_DIR}/gxx.cmd")
+	set(MINGW_RC_COMPILER "${MINGW_WRAPPER_DIR}/windres.cmd")
+else()
+	set(MINGW_C_COMPILER "${MINGW_REAL_C_COMPILER}")
+	set(MINGW_CXX_COMPILER "${MINGW_REAL_CXX_COMPILER}")
+	set(MINGW_RC_COMPILER "${MINGW_REAL_RC_COMPILER}")
 endif()
 
 set(CMAKE_C_COMPILER   ${MINGW_C_COMPILER})
@@ -43,7 +93,14 @@ set(CMAKE_RANLIB       ${MINGW_RANLIB})
 # PACKAGE uses BOTH so find_package() can locate packages installed by
 # nested ExternalProject builds (microcdr under the PX4 build tree) as
 # well as packages living in the MinGW sysroot.
-set(CMAKE_FIND_ROOT_PATH /usr/${TOOLCHAIN_PREFIX})
+if(CMAKE_HOST_WIN32)
+	get_filename_component(MINGW_PREFIX "${MINGW_BIN_DIR}" DIRECTORY)
+	set(CMAKE_FIND_ROOT_PATH
+		"${MINGW_PREFIX}"
+		"${MINGW_PREFIX}/${TOOLCHAIN_PREFIX}")
+else()
+	set(CMAKE_FIND_ROOT_PATH /usr/${TOOLCHAIN_PREFIX})
+endif()
 set(CMAKE_FIND_ROOT_PATH_MODE_PROGRAM NEVER)
 set(CMAKE_FIND_ROOT_PATH_MODE_LIBRARY ONLY)
 set(CMAKE_FIND_ROOT_PATH_MODE_INCLUDE ONLY)
@@ -57,6 +114,20 @@ set(CMAKE_FIND_ROOT_PATH_MODE_PACKAGE BOTH)
 get_filename_component(_px4_windows_shim_dir
 	"${CMAKE_CURRENT_LIST_DIR}/../include/windows_shim" ABSOLUTE)
 include_directories(BEFORE SYSTEM "${_px4_windows_shim_dir}")
+
+# Vendored upstream code (Micro-XRCE-DDS-Client, CycloneDDS, libvnc) writes
+# `#include <Windows.h>`. MinGW only ships the lowercase header, so on
+# case-sensitive hosts (Linux, macOS) we need an uppercase alias. On
+# case-insensitive hosts (Windows itself) the alias must NOT exist on the
+# include path: a shim `Windows.h` would match `#include <windows.h>` first
+# and `#pragma once`-recurse to itself, hiding the real header. Generate
+# the alias under the build tree only when we actually need it.
+if(NOT CMAKE_HOST_SYSTEM_NAME STREQUAL "Windows")
+	set(_px4_windows_case_alias_dir ${CMAKE_BINARY_DIR}/windows_case_alias)
+	file(WRITE ${_px4_windows_case_alias_dir}/Windows.h
+		"#pragma once\n#include <windows.h>\n")
+	include_directories(BEFORE SYSTEM ${_px4_windows_case_alias_dir})
+endif()
 
 # Target Windows 10 (1803+) so AF_UNIX is available in WinSock2.
 add_compile_definitions(

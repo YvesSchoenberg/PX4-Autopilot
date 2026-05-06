@@ -51,7 +51,9 @@ add_library(px4_layer
 	SerialImpl.cpp
 )
 target_compile_definitions(px4_layer PRIVATE MODULE_NAME="px4")
-target_compile_options(px4_layer PRIVATE -Wno-cast-align) # TODO: fix and enable
+px4_target_compile_options_for_compiler(px4_layer PRIVATE
+	GNU_LIKE -Wno-cast-align # TODO: fix and enable
+)
 target_link_libraries(px4_layer PRIVATE work_queue px4_work_queue)
 target_link_libraries(px4_layer PRIVATE px4_daemon drivers_board)
 

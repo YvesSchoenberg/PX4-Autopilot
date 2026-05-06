@@ -211,13 +211,17 @@ function(px4_posix_generate_symlinks)
 		if (MAIN)
 			set(ln_name "${PREFIX}${MAIN}")
 			if(WIN32 OR MINGW)
-				# Windows symlinks require admin; copy the exe instead so that
-				# px4-<module>.exe can be invoked the same way as on POSIX.
+				set(alias_executable "${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/${ln_name}.exe")
+
+				# Windows symlinks require extra privileges. Hard links keep the
+				# px4-<module>.exe entry points without duplicating the MSVC exe.
 				add_custom_command(TARGET ${TARGET}
 					POST_BUILD
-					COMMAND ${CMAKE_COMMAND} -E copy
+					COMMAND ${CMAKE_COMMAND} -E remove -f
+						${alias_executable}
+					COMMAND ${CMAKE_COMMAND} -E create_hardlink
 						$<TARGET_FILE:${TARGET}>
-						${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/${ln_name}.exe
+						${alias_executable}
 				)
 			else()
 				add_custom_command(TARGET ${TARGET}
@@ -245,7 +249,7 @@ function(px4_os_add_flags)
 	add_definitions(-D__PX4_POSIX)
 
 	if(MSVC)
-		add_definitions(-Dnoreturn_function=__declspec\(noreturn\))
+		add_definitions(-Dnoreturn_function=)
 	else()
 		add_definitions(-Dnoreturn_function=__attribute__\(\(noreturn\)\))
 	endif()
