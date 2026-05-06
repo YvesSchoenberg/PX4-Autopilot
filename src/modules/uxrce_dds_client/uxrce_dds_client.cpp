@@ -190,6 +190,14 @@ bool UxrceddsClient::init()
 
 		} else {
 			PX4_ERR("init UDP agent IP:%s, port:%s failed", _agent_ip, _port);
+
+			// Symmetric with the serial path above: free the half-initialised
+			// transport here rather than leaving it dangling for the next
+			// init() call to clean up. uxr_init_udp_platform() now releases
+			// its socket / WSAStartup ref on its own failure paths, so
+			// dropping the C++ wrapper here does not leak Winsock state.
+			delete _transport_udp;
+			_transport_udp = nullptr;
 		}
 	}
 

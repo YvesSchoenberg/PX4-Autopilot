@@ -70,6 +70,14 @@ else()
 		set(lib_dir "lib")
 	endif()
 
+	set(microxrceddsclient_make_program ${CMAKE_MAKE_PROGRAM})
+	if(microxrceddsclient_make_program)
+		file(TO_CMAKE_PATH "${microxrceddsclient_make_program}" microxrceddsclient_make_program)
+	endif()
+
+	set(microxrceddsclient_library ${CMAKE_CURRENT_BINARY_DIR}/${lib_dir}/${CMAKE_STATIC_LIBRARY_PREFIX}microxrcedds_client${CMAKE_STATIC_LIBRARY_SUFFIX})
+	set(microcdr_library ${CMAKE_CURRENT_BINARY_DIR}/${lib_dir}/${CMAKE_STATIC_LIBRARY_PREFIX}microcdr${CMAKE_STATIC_LIBRARY_SUFFIX})
+
 	include(ExternalProject)
 	ExternalProject_Add(
 		libmicroxrceddsclient_project
@@ -86,7 +94,7 @@ else()
 			# Forward the generator + make program so nested superbuilds
 			# (microcdr, uclient) can configure themselves without a second
 			# round of auto-detection.
-			-DCMAKE_MAKE_PROGRAM:FILEPATH=${CMAKE_MAKE_PROGRAM}
+			-DCMAKE_MAKE_PROGRAM:FILEPATH=${microxrceddsclient_make_program}
 			-DUCLIENT_PIC:BOOL=OFF
 			-DUCLIENT_PROFILE_TCP:BOOL=OFF
 			-DUCLIENT_PROFILE_UDP:BOOL=ON
@@ -103,8 +111,9 @@ else()
 			-DCMAKE_INSTALL_PREFIX:PATH=${CMAKE_CURRENT_BINARY_DIR}
 			-DCMAKE_PREFIX_PATH:PATH=${CMAKE_CURRENT_BINARY_DIR}
 			-DCMAKE_TOOLCHAIN_FILE:STRING=${microxrceddsclient_toolchain}
-		BUILD_BYPRODUCTS ${CMAKE_CURRENT_BINARY_DIR}/${lib_dir}/libmicroxrcedds_client.a
-		BUILD_BYPRODUCTS ${CMAKE_CURRENT_BINARY_DIR}/${lib_dir}/libmicrocdr.a
+		BUILD_BYPRODUCTS
+			${microxrceddsclient_library}
+			${microcdr_library}
 		DEPENDS prebuild_targets git_micro_xrce_dds_client
 		LOG_CONFIGURE true
 		LOG_BUILD true
@@ -114,12 +123,23 @@ else()
 
 	add_library(libmicroxrceddsclient STATIC IMPORTED GLOBAL)
 	set_target_properties(libmicroxrceddsclient
-		PROPERTIES IMPORTED_LOCATION ${CMAKE_CURRENT_BINARY_DIR}/${lib_dir}/libmicroxrcedds_client.a
+		PROPERTIES IMPORTED_LOCATION ${microxrceddsclient_library}
 	)
+
+	# udp_transport_windows.c references getaddrinfo/freeaddrinfo/socket
+	# from ws2_32 and adapter helpers from iphlpapi. CMake places this
+	# IMPORTED archive at the very end of the px4 link line, after the
+	# platform `target_link_libraries(px4 ws2_32 …)` call, so we have to
+	# attach the import libs to the archive itself for GNU ld to resolve
+	# the symbols on the single forward pass.
+	if(WIN32 OR MINGW)
+		set_property(TARGET libmicroxrceddsclient
+			APPEND PROPERTY INTERFACE_LINK_LIBRARIES ws2_32 iphlpapi)
+	endif()
 
 	add_library(libmicrocdr STATIC IMPORTED GLOBAL)
 	set_target_properties(libmicrocdr
-		PROPERTIES IMPORTED_LOCATION ${CMAKE_CURRENT_BINARY_DIR}/${lib_dir}/libmicrocdr.a
+		PROPERTIES IMPORTED_LOCATION ${microcdr_library}
 	)
 
 	add_library(microxrceddsclient INTERFACE)
