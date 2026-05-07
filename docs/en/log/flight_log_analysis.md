@@ -41,6 +41,22 @@ Key features:
 
 See [Log Analysis using Flight Review](../log/flight_review.md) for an introduction.
 
+
+### Roboto
+
+[Roboto](https://www.roboto.ai/)  is a robotics data analytics platform that helps teams automate flight log analysis, detect issues, and debug failures.
+
+Key features:
+
+- Native support for ULog, ROS bag, Journalctl, and other common robotics log formats.
+- Automatic detection of common flight issues such as vibration, GPS degradation, estimator problems, and console log errors.
+- SDK and query APIs to search and retrieve data across flights and fleets.
+- Actions and Triggers to automate post-flight analysis and generate Flight Review reports.
+- Interactive visualization for time-series data, maps, events, and console logs.
+- AI Chat and Agents for debugging, triaging, summarization, and flight analysis using natural language.
+
+See [Working with PX4 Logs](https://docs.roboto.ai/user-guides/working-with-px4-logs.html) for an introduction.
+
 ### Foxglove
 
 [Foxglove](https://foxglove.dev/) is a purpose-built robotics observation platform that works natively with ULog.
@@ -192,3 +208,5 @@ Key features:
 You can use the online version of the tool for small log files (< 32Mb), or run it locally in order to analyze longer flights.
 
 ![Data Comets](../../assets/flight_log_analysis/data_comets/data_comets_overview.gif)
+
+
