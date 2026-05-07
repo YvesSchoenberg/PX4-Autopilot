@@ -57,6 +57,8 @@ Key features:
 
 See [Working with PX4 Logs](https://docs.roboto.ai/user-guides/working-with-px4-logs.html) for an introduction.
 
+![Roboto](../../assets/flight_log_analysis/roboto/roboto.png)
+
 ### Foxglove
 
 [Foxglove](https://foxglove.dev/) is a purpose-built robotics observation platform that works natively with ULog.
