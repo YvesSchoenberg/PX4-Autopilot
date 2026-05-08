@@ -210,5 +210,3 @@ Key features:
 You can use the online version of the tool for small log files (< 32Mb), or run it locally in order to analyze longer flights.
 
 ![Data Comets](../../assets/flight_log_analysis/data_comets/data_comets_overview.gif)
-
-
