@@ -49,11 +49,11 @@ See [Log Analysis using Flight Review](../log/flight_review.md) for an introduct
 Key features:
 
 - Native support for ULog, ROS bag, Journalctl, and other common robotics log formats.
-- Automatic detection of common flight issues such as vibration, GPS degradation, estimator problems, and console log errors.
-- SDK and query APIs to search and retrieve data across flights and fleets.
-- Actions and Triggers to automate post-flight analysis and generate Flight Review reports.
+- AI Chat and Agents for accelerated debug, triage, summarization, and flight analysis using natural language.
+- Automatic detection of common flight issues such as high vibration, GPS degradation, estimator failures, and log errors.
+- SDK and query APIs to search and aggregate data across flights and fleets.
+- Actions and Triggers to automate custom post-flight analysis and generate reports.
 - Interactive visualization for time-series data, maps, events, and console logs.
-- AI Chat and Agents for debugging, triaging, summarization, and flight analysis using natural language.
 
 See [Working with PX4 Logs](https://docs.roboto.ai/user-guides/working-with-px4-logs.html) for an introduction.
 
